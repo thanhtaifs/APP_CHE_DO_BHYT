@@ -1454,7 +1454,7 @@ class ExcludeSummaryPage(QWidget):
         QMessageBox.critical(self, "Lỗi", msg)
 
     def export_summary(self):
-        if self.summary_cd_df is None:
+        if self.summary_cd_df is None or self.summary_cd_loai_df is None or self.detail_df is None:
             QMessageBox.warning(self, "Không có dữ liệu", "Chưa có kết quả để xuất.")
             return
         path, _ = QFileDialog.getSaveFileName(
