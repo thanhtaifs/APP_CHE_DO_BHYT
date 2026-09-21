@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QFileDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QProgressBar, QMessageBox, QGroupBox,
-    QCheckBox, QFrame, QSizePolicy
+    QCheckBox, QFrame, QSizePolicy, QAbstractItemView
 )
 
 NONE_OPTION = "-- Không dùng --"
@@ -231,16 +231,6 @@ def split_multi_codes(v) -> list:
     return [normalize_code(p) for p in parts if normalize_code(p) != ""]
 
 
-def code_matches(row_code: str, allowed_code: str, prefix_match: bool) -> bool:
-    """So khớp 1 mã bệnh của hồ sơ với 1 mã bệnh cho phép trong quy tắc."""
-    if row_code == allowed_code:
-        return True
-    if prefix_match and row_code and allowed_code:
-        if row_code.startswith(allowed_code) or allowed_code.startswith(row_code):
-            return True
-    return False
-
-
 DEFAULT_LY_DO_TC_TEMPLATE = (
     "MA_CP {MA_CP} không phù hợp chẩn đoán (MA_BENH={MA_BENH}; "
     "MA_BENH_KHAC={MA_BENH_KHAC}); chỉ áp dụng nhóm {NHOM_BENH}: {DANH_SACH_MA_BENH}"
@@ -283,40 +273,6 @@ def upsert_rules(conn, rules_df: pd.DataFrame) -> int:
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM QUY_TAC_BENH")
     return cur.fetchone()[0]
-
-
-_STT_PATTERN = re.compile(r"^\d+[.\)]?$")
-
-
-def parse_pasted_benh_lines(text: str) -> list:
-    """
-    Phân tích văn bản dán nhiều dòng (copy từ Word/Excel, các cột cách nhau bởi
-    Tab hoặc nhiều khoảng trắng) thành danh sách dict {MA_BENH, TEN_BENH, NHOM_BENH}.
-    Tự động bỏ qua cột số thứ tự (STT) nếu có ở đầu dòng.
-    Ví dụ dòng hợp lệ: "1.        L55    Bỏng nắng    BONG"
-    """
-    result = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if "\t" in line:
-            tokens = [t.strip() for t in line.split("\t")]
-        else:
-            tokens = [t.strip() for t in re.split(r"\s{2,}", line)]
-        tokens = [t for t in tokens if t != ""]
-        if not tokens:
-            continue
-        if _STT_PATTERN.match(tokens[0]):
-            tokens = tokens[1:]
-        if not tokens:
-            continue
-        ma_benh = normalize_code(tokens[0])
-        ten_benh = tokens[1] if len(tokens) > 1 else ""
-        nhom_benh = normalize_code(tokens[2]) if len(tokens) > 2 else ""
-        if ma_benh:
-            result.append({"MA_BENH": ma_benh, "TEN_BENH": ten_benh, "NHOM_BENH": nhom_benh})
-    return result
 
 
 def fill_table_widget(table: QTableWidget, df: pd.DataFrame, columns, max_rows=1000):
@@ -1454,7 +1410,7 @@ class ExcludeSummaryPage(QWidget):
         QMessageBox.critical(self, "Lỗi", msg)
 
     def export_summary(self):
-        if self.summary_cd_df is None or self.summary_cd_loai_df is None or self.detail_df is None:
+        if self.summary_cd_df is None:
             QMessageBox.warning(self, "Không có dữ liệu", "Chưa có kết quả để xuất.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -1558,71 +1514,6 @@ class RuleLoadWorker(QThread):
 
 
 # ============================================================
-# WORKER: THÊM NHANH QUY TẮC (DÁN DANH SÁCH MÃ BỆNH, KHÔNG CẦN FILE EXCEL)
-# ============================================================
-
-class QuickAddRuleWorker(QThread):
-    log = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    finished_ok = pyqtSignal(int, int)  # số dòng thêm, tổng số quy tắc trong CSDL sau khi thêm
-    failed = pyqtSignal(str)
-
-    def __init__(self, ma_chuyen_de, ten_chuyen_de, ma_cp, ten_cp, nhom_benh_override, parsed_lines):
-        super().__init__()
-        self.ma_chuyen_de = ma_chuyen_de
-        self.ten_chuyen_de = ten_chuyen_de
-        self.ma_cp = ma_cp
-        self.ten_cp = ten_cp
-        self.nhom_benh_override = nhom_benh_override
-        self.parsed_lines = parsed_lines  # list[dict{MA_BENH, TEN_BENH, NHOM_BENH}]
-
-    def run(self):
-        try:
-            if not self.parsed_lines:
-                raise ValueError(
-                    "Không phân tích được dòng mã bệnh nào từ văn bản đã dán. "
-                    "Mỗi dòng cần có ít nhất 1 mã bệnh (cách các cột bởi Tab hoặc "
-                    "nhiều khoảng trắng)."
-                )
-            self.progress.emit(20)
-
-            rules = pd.DataFrame([
-                {
-                    "MA_CHUYEN_DE": normalize_code(self.ma_chuyen_de),
-                    "TEN_CHUYEN_DE": self.ten_chuyen_de,
-                    "MA_CP": normalize_code(self.ma_cp),
-                    "TEN_CP": self.ten_cp,
-                    "MA_BENH": item["MA_BENH"],
-                    "TEN_BENH": item["TEN_BENH"],
-                    "NHOM_BENH": normalize_code(self.nhom_benh_override) or item["NHOM_BENH"],
-                }
-                for item in self.parsed_lines
-            ])
-            rules = rules.drop_duplicates(subset=["MA_CHUYEN_DE", "MA_CP", "MA_BENH"])
-            self.progress.emit(50)
-
-            self.log.emit(f"Đang thêm {len(rules)} dòng quy tắc (Mã chuyên đề={self.ma_chuyen_de}, MA_CP={self.ma_cp})...")
-
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                total_after = upsert_rules(conn, rules)
-            finally:
-                conn.close()
-
-            self.progress.emit(100)
-            self.log.emit(
-                f"Hoàn tất. Đã thêm {len(rules)} dòng quy tắc. "
-                f"Tổng số quy tắc hiện có trong CSDL: {total_after}."
-            )
-            self.finished_ok.emit(len(rules), total_after)
-
-        except Exception as e:
-            self.log.emit("LỖI: " + str(e))
-            self.log.emit(traceback.format_exc())
-            self.failed.emit(str(e))
-
-
-# ============================================================
 # WORKER: KIỂM TRA HỒ SƠ THEO QUY TẮC GIÁM ĐỊNH CHUYÊN ĐỀ
 # ============================================================
 
@@ -1633,71 +1524,105 @@ class RuleCheckWorker(QThread):
     finished_ok = pyqtSignal(object, int, int, int)
     failed = pyqtSignal(str)
 
-    def __init__(self, source_type, input_path, src_db_path, src_table_name,
+    def __init__(self, src_db_path, src_table_name,
                  col_ma_cp, col_ma_benh, col_ma_benh_khac,
-                 col_ma_chuyen_de, prefix_match, ma_ly_do_tc, ly_do_tc_template):
+                 col_ma_chuyen_de, ma_ly_do_tc, ly_do_tc_template):
         super().__init__()
-        self.source_type = source_type  # "excel" hoặc "sqlite"
-        self.input_path = input_path
         self.src_db_path = src_db_path
         self.src_table_name = src_table_name
         self.col_ma_cp = col_ma_cp
         self.col_ma_benh = col_ma_benh
         self.col_ma_benh_khac = col_ma_benh_khac
         self.col_ma_chuyen_de = col_ma_chuyen_de
-        self.prefix_match = prefix_match
         self.ma_ly_do_tc = ma_ly_do_tc
         self.ly_do_tc_template = ly_do_tc_template
 
-    @staticmethod
-    def _get_val(row, colname):
-        if colname and colname != NONE_OPTION:
-            v = row.get(colname)
-            return "" if pd.isna(v) else str(v).strip()
-        return ""
-
     def run(self):
         try:
-            if self.source_type == "sqlite":
-                self.log.emit(f"Đang đọc bảng '{self.src_table_name}' từ CSDL SQLite ngoài...")
-                src_conn = sqlite3.connect(self.src_db_path)
-                try:
-                    df = pd.read_sql_query(f'SELECT * FROM "{self.src_table_name}"', src_conn)
-                finally:
-                    src_conn.close()
-            else:
-                self.log.emit("Đang đọc file Excel hồ sơ cần kiểm tra...")
-                df = read_table_any(self.input_path)
-            self.progress.emit(10)
+            self.log.emit(f"Đang kết nối CSDL nguồn '{self.src_table_name}'...")
+            conn = sqlite3.connect(self.src_db_path)
 
-            if self.col_ma_cp not in df.columns:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_cp}' (dùng cho MA_CP) trong file.")
+            cur = conn.execute(f'PRAGMA table_info("{self.src_table_name}")')
+            src_cols = [row[1] for row in cur.fetchall()]
+            if self.col_ma_cp not in src_cols:
+                raise ValueError(f"Không tìm thấy cột '{self.col_ma_cp}' (dùng cho MA_CP) trong bảng.")
             use_ma_benh = bool(self.col_ma_benh) and self.col_ma_benh != NONE_OPTION
             use_ma_benh_khac = bool(self.col_ma_benh_khac) and self.col_ma_benh_khac != NONE_OPTION
             if not use_ma_benh and not use_ma_benh_khac:
                 raise ValueError("Cần chọn ít nhất 1 trong 2 cột MA_BENH hoặc MA_BENH_KHAC để kiểm tra.")
-            if use_ma_benh and self.col_ma_benh not in df.columns:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_benh}' trong file.")
-            if use_ma_benh_khac and self.col_ma_benh_khac not in df.columns:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_benh_khac}' trong file.")
+            if use_ma_benh and self.col_ma_benh not in src_cols:
+                raise ValueError(f"Không tìm thấy cột '{self.col_ma_benh}' trong bảng.")
+            if use_ma_benh_khac and self.col_ma_benh_khac not in src_cols:
+                raise ValueError(f"Không tìm thấy cột '{self.col_ma_benh_khac}' trong bảng.")
             use_ma_cd = bool(self.col_ma_chuyen_de) and self.col_ma_chuyen_de != NONE_OPTION
-            if use_ma_cd and self.col_ma_chuyen_de not in df.columns:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_chuyen_de}' trong file.")
+            if use_ma_cd and self.col_ma_chuyen_de not in src_cols:
+                raise ValueError(f"Không tìm thấy cột '{self.col_ma_chuyen_de}' trong bảng.")
 
-            self.log.emit("Đang nạp danh mục quy tắc từ CSDL...")
-            conn = sqlite3.connect(DB_PATH)
+            self.progress.emit(10)
+
+            self.log.emit("Đang gắn CSDL quy tắc (ATTACH DATABASE) để đối chiếu bằng SQL...")
+            safe_rules_path = DB_PATH.replace("'", "''")
+            conn.execute(f"ATTACH DATABASE '{safe_rules_path}' AS rulesdb")
             try:
-                ensure_rules_table(conn)
-                rules_df = pd.read_sql_query("SELECT * FROM QUY_TAC_BENH", conn)
-            finally:
-                conn.close()
-
-            if rules_df.empty:
+                conn.execute("SELECT COUNT(*) FROM rulesdb.QUY_TAC_BENH")
+            except sqlite3.OperationalError:
                 raise ValueError(
                     "Chưa có quy tắc nào trong danh mục. Vui lòng nạp danh mục quy tắc ở "
-                    "mục 1 trước khi kiểm tra."
+                    "trang 'Quản lý quy tắc giám định' trước khi kiểm tra."
                 )
-            self.progress.emit(25)
+            self.progress.emit(20)
+
+            # --- Xây dựng điều kiện SQL: dòng có quy tắc áp dụng & dòng SAI quy tắc ---
+            match_parts = []
+            if use_ma_benh:
+                match_parts.append(f'r.MA_BENH = s."{self.col_ma_benh}"')
+            if use_ma_benh_khac:
+                match_parts.append(
+                    f'instr(";" || COALESCE(s."{self.col_ma_benh_khac}", "") || ";", '
+                    f'";" || r.MA_BENH || ";") > 0'
+                )
+            match_sql = " OR ".join(match_parts)
+
+            if use_ma_cd:
+                scope_sql = f'r.MA_CP = s."{self.col_ma_cp}" AND r.MA_CHUYEN_DE = s."{self.col_ma_chuyen_de}"'
+            else:
+                scope_sql = f'r.MA_CP = s."{self.col_ma_cp}"'
+
+            applicable_sql = f'EXISTS (SELECT 1 FROM rulesdb.QUY_TAC_BENH r WHERE {scope_sql})'
+            violation_sql = (
+                f'NOT EXISTS (SELECT 1 FROM rulesdb.QUY_TAC_BENH r '
+                f'WHERE {scope_sql} AND ({match_sql}))'
+            )
+
+            self.log.emit("Đang truy vấn SQL để lấy các dòng chỉ định SAI quy tắc...")
+            total = pd.read_sql_query(
+                f'SELECT COUNT(*) c FROM "{self.src_table_name}"', conn
+            ).iloc[0, 0]
+            so_co_quy_tac = pd.read_sql_query(
+                f'SELECT COUNT(*) c FROM "{self.src_table_name}" s WHERE {applicable_sql}', conn
+            ).iloc[0, 0]
+            self.progress.emit(40)
+
+            violations_raw = pd.read_sql_query(
+                f'SELECT * FROM "{self.src_table_name}" s '
+                f'WHERE {applicable_sql} AND {violation_sql}',
+                conn
+            )
+            self.progress.emit(70)
+            conn.close()
+
+            self.log.emit(
+                f"SQL trả về {len(violations_raw)} dòng SAI quy tắc (trên {so_co_quy_tac} dòng "
+                f"có quy tắc áp dụng / {total} dòng tổng)."
+            )
+
+            # --- Nạp chi tiết quy tắc (chỉ để dựng nội dung lý do LY_DO_TC) ---
+            rconn = sqlite3.connect(DB_PATH)
+            try:
+                ensure_rules_table(rconn)
+                rules_df = pd.read_sql_query("SELECT * FROM QUY_TAC_BENH", rconn)
+            finally:
+                rconn.close()
 
             rules_by_cd_cp = {}
             rules_by_cp = {}
@@ -1712,77 +1637,62 @@ class RuleCheckWorker(QThread):
                 if nhom:
                     entry_cp["nhom"].add(nhom)
 
-            self.log.emit(
-                f"Đã nạp {len(rules_df)} dòng quy tắc, gồm {len(rules_by_cp)} MA_CP khác nhau."
-            )
-
             violations = []
-            total = len(df)
-            so_co_quy_tac = 0
-            row_dicts = df.to_dict("records")
-
-            for i, row in enumerate(row_dicts):
-                ma_cp = normalize_code(self._get_val(row, self.col_ma_cp))
-                if ma_cp == "":
-                    continue
-                ma_chuyen_de = normalize_code(self._get_val(row, self.col_ma_chuyen_de)) if use_ma_cd else ""
-
-                rule_entry = None
-                if ma_chuyen_de and (ma_chuyen_de, ma_cp) in rules_by_cd_cp:
-                    rule_entry = rules_by_cd_cp[(ma_chuyen_de, ma_cp)]
-                elif ma_cp in rules_by_cp:
-                    rule_entry = rules_by_cp[ma_cp]
-
+            for row in violations_raw.to_dict("records"):
+                ma_cp = normalize_code(row.get(self.col_ma_cp, ""))
+                ma_chuyen_de = normalize_code(row.get(self.col_ma_chuyen_de, "")) if use_ma_cd else ""
+                rule_entry = (
+                    rules_by_cd_cp.get((ma_chuyen_de, ma_cp)) if use_ma_cd
+                    else rules_by_cp.get(ma_cp)
+                )
                 if rule_entry is None:
                     continue
-                so_co_quy_tac += 1
 
-                ma_benh = normalize_code(self._get_val(row, self.col_ma_benh)) if use_ma_benh else ""
-                ma_benh_khac_raw = self._get_val(row, self.col_ma_benh_khac) if use_ma_benh_khac else ""
-                ma_benh_khac_list = split_multi_codes(ma_benh_khac_raw)
-
-                row_codes = ([ma_benh] if ma_benh else []) + ma_benh_khac_list
-                allowed = rule_entry["codes"]
-
-                matched = any(
-                    code_matches(rc, ac, self.prefix_match)
-                    for rc in row_codes for ac in allowed
+                ma_benh = normalize_code(row.get(self.col_ma_benh, "")) if use_ma_benh else ""
+                ma_benh_khac_list = (
+                    split_multi_codes(row.get(self.col_ma_benh_khac, "")) if use_ma_benh_khac else []
                 )
-
-                if not matched:
-                    out_row = dict(row)
-                    out_row["MA_LY_DO_TC"] = self.ma_ly_do_tc
-                    nhom_txt = ", ".join(sorted(rule_entry["nhom"])) if rule_entry["nhom"] else "(không xác định)"
-                    codes_txt = ", ".join(sorted(allowed))
-                    try:
-                        ly_do = self.ly_do_tc_template.format(
-                            MA_CP=ma_cp,
-                            MA_BENH=ma_benh or "(trống)",
-                            MA_BENH_KHAC=(";".join(ma_benh_khac_list) or "(trống)"),
-                            NHOM_BENH=nhom_txt,
-                            DANH_SACH_MA_BENH=codes_txt,
-                        )
-                    except (KeyError, IndexError):
-                        ly_do = DEFAULT_LY_DO_TC_TEMPLATE.format(
-                            MA_CP=ma_cp,
-                            MA_BENH=ma_benh or "(trống)",
-                            MA_BENH_KHAC=(";".join(ma_benh_khac_list) or "(trống)"),
-                            NHOM_BENH=nhom_txt,
-                            DANH_SACH_MA_BENH=codes_txt,
-                        )
-                    out_row["LY_DO_TC"] = ly_do
-                    violations.append(out_row)
-
-                if i % 500 == 0:
-                    self.progress.emit(25 + int(i / max(total, 1) * 65))
+                nhom_txt = ", ".join(sorted(rule_entry["nhom"])) if rule_entry["nhom"] else "(không xác định)"
+                codes_txt = ", ".join(sorted(rule_entry["codes"]))
+                try:
+                    ly_do = self.ly_do_tc_template.format(
+                        MA_CP=ma_cp,
+                        MA_BENH=ma_benh or "(trống)",
+                        MA_BENH_KHAC=(";".join(ma_benh_khac_list) or "(trống)"),
+                        NHOM_BENH=nhom_txt,
+                        DANH_SACH_MA_BENH=codes_txt,
+                    )
+                except (KeyError, IndexError):
+                    ly_do = DEFAULT_LY_DO_TC_TEMPLATE.format(
+                        MA_CP=ma_cp,
+                        MA_BENH=ma_benh or "(trống)",
+                        MA_BENH_KHAC=(";".join(ma_benh_khac_list) or "(trống)"),
+                        NHOM_BENH=nhom_txt,
+                        DANH_SACH_MA_BENH=codes_txt,
+                    )
+                # Chuẩn hoá dòng xuất ra theo đúng OUTPUT_COLUMNS (giống cấu trúc cột của
+                # chức năng Tra cứu XML1): lấy giá trị từ nguồn nếu có cột trùng tên, cột
+                # nào nguồn không có sẽ để trống; riêng MA_LY_DO_TC/LY_DO_TC luôn lấy giá
+                # trị vừa tính từ quy tắc.
+                out_row = {}
+                for col in OUTPUT_COLUMNS:
+                    if col in ("MA_LY_DO_TC", "LY_DO_TC"):
+                        continue
+                    v = row.get(col, "")
+                    out_row[col] = "" if pd.isna(v) else v
+                out_row["MA_LY_DO_TC"] = self.ma_ly_do_tc
+                out_row["LY_DO_TC"] = ly_do
+                violations.append(out_row)
 
             violations_df = pd.DataFrame(violations)
+            if not violations_df.empty:
+                violations_df = violations_df[OUTPUT_COLUMNS]
             self.progress.emit(100)
             self.log.emit(
-                f"Đã kiểm tra {total} dòng, {so_co_quy_tac} dòng có quy tắc áp dụng theo MA_CP, "
+                f"Hoàn tất. Đã kiểm tra {total} dòng, {so_co_quy_tac} dòng có quy tắc áp dụng, "
                 f"phát hiện {len(violations_df)} dòng chỉ định SAI quy định."
             )
-            self.finished_ok.emit(violations_df, total, so_co_quy_tac, len(violations_df))
+            self.finished_ok.emit(violations_df, int(total), int(so_co_quy_tac), len(violations_df))
 
         except Exception as e:
             self.log.emit("LỖI: " + str(e))
@@ -2072,33 +1982,36 @@ class SaveDeductedPage(QWidget):
 # TRANG 5: QUY TẮC GIÁM ĐỊNH THEO CHUYÊN ĐỀ
 # ============================================================
 
-class RuleAuditPage(QWidget):
+# ============================================================
+# TRANG 5: QUẢN LÝ QUY TẮC GIÁM ĐỊNH THEO CHUYÊN ĐỀ
+# ============================================================
+
+class RuleManagePage(QWidget):
     def __init__(self):
         super().__init__()
         self.rule_file_columns = []
-        self.check_file_columns = []
-        self.violations_df = None
+        self.rules_table_df = None
         self._build_ui()
+        self.refresh_rules_table()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
-        layout.addWidget(page_title("Quy tắc giám định theo chuyên đề"))
+        layout.addWidget(page_title("Quản lý quy tắc giám định theo chuyên đề"))
         note = QLabel(
             "Định nghĩa quy tắc: với mỗi Mã chuyên đề + Mã chi phí (MA_CP), khai báo danh "
-            "sách các Mã bệnh (MA_BENH, theo ICD) được phép chỉ định. Khi kiểm tra hồ sơ, "
-            "nếu MA_CP được dùng nhưng cả MA_BENH và MA_BENH_KHAC (nhiều mã cách nhau bởi "
-            "dấu ';') đều KHÔNG thuộc danh sách cho phép, hồ sơ đó bị coi là chỉ định SAI "
-            "quy định và được xuất ra kèm mã/lý do từ chối."
+            "sách các Mã bệnh (MA_BENH, theo ICD) được phép chỉ định. Nạp danh mục bằng "
+            "file Excel đúng cấu trúc cột quy định, sau đó có thể xem/xoá từng quy tắc ở "
+            "bảng bên dưới. Quy tắc được dùng ở chức năng '🚨 Kiểm tra hồ sơ theo quy tắc'."
         )
         note.setWordWrap(True)
         note.setObjectName("noteLabel")
         layout.addWidget(note)
 
-        # --- Nhóm 1: Nạp danh mục quy tắc ---
-        rule_group = QGroupBox("1. Danh mục quy tắc (Mã chuyên đề + MA_CP → các MA_BENH cho phép)")
+        # --- Nhóm 1: Nạp danh mục quy tắc bằng Excel ---
+        rule_group = QGroupBox("1. Nạp danh mục quy tắc bằng file Excel")
         rule_form = QFormLayout()
 
         self.rule_path_edit = QLineEdit()
@@ -2132,148 +2045,40 @@ class RuleAuditPage(QWidget):
         layout.addWidget(rule_group)
 
         self.load_rules_btn = QPushButton("Nạp / Cập nhật danh mục quy tắc vào CSDL")
+        self.load_rules_btn.setObjectName("primaryBtn")
         self.load_rules_btn.clicked.connect(self.run_load_rules)
         layout.addWidget(self.load_rules_btn)
 
         rules_db_info = QLabel(
             f"📁 Quy tắc được lưu vào bảng QUY_TAC_BENH trong CSDL DÙNG CHUNG của toàn "
             f"phần mềm (gắn cố định kèm phần mềm): {DB_PATH}\n"
-            "Nạp lại file danh mục nhiều lần sẽ tự động CẬP NHẬT quy tắc trùng "
-            "(Mã chuyên đề + MA_CP + MA_BENH) thay vì tạo bản ghi trùng."
+            "Nạp lại quy tắc trùng khoá (Mã chuyên đề + MA_CP + MA_BENH) sẽ tự động CẬP "
+            "NHẬT thay vì tạo bản ghi trùng — nạp lại file đã sửa để cập nhật quy tắc."
         )
         rules_db_info.setWordWrap(True)
         rules_db_info.setObjectName("noteLabel")
         layout.addWidget(rules_db_info)
 
-        # --- Nhóm 1b: Import nhanh quy tắc bằng cách dán danh sách mã bệnh ---
-        quick_group = QGroupBox(
-            "1b. Import nhanh quy tắc (dán danh sách mã bệnh, không cần file Excel)"
-        )
-        quick_layout = QVBoxLayout()
-        quick_desc = QLabel(
-            "Dùng khi bạn có sẵn 1 bảng mã bệnh dạng như ví dụ: dán trực tiếp các dòng "
-            "đã copy từ Word/Excel vào ô bên dưới (mỗi dòng 1 mã bệnh, các cột cách nhau "
-            "bởi Tab hoặc nhiều khoảng trắng, có thể có số thứ tự ở đầu dòng - phần mềm "
-            "tự bỏ qua). Ví dụ:\n"
-            "1.\tL55\tBỏng nắng\tBONG\n"
-            "2.\tL55.0\tBỏng nắng độ một\tBONG"
-        )
-        quick_desc.setWordWrap(True)
-        quick_layout.addWidget(quick_desc)
+        # --- Nhóm 2: Danh sách quy tắc hiện có (xem / xoá) ---
+        list_group = QGroupBox("2. Danh sách quy tắc hiện có")
+        list_layout = QVBoxLayout()
 
-        quick_form = QFormLayout()
-        self.quick_ma_cd_edit = QLineEdit()
-        quick_form.addRow("Mã chuyên đề:", self.quick_ma_cd_edit)
-        self.quick_ten_cd_edit = QLineEdit()
-        quick_form.addRow("Tên chuyên đề (nếu có):", self.quick_ten_cd_edit)
-        self.quick_ma_cp_edit = QLineEdit()
-        quick_form.addRow("MA_CP:", self.quick_ma_cp_edit)
-        self.quick_ten_cp_edit = QLineEdit()
-        quick_form.addRow("Tên chi phí (nếu có):", self.quick_ten_cp_edit)
-        self.quick_nhom_benh_edit = QLineEdit()
-        quick_form.addRow(
-            "Nhóm bệnh áp dụng cho mọi dòng dán\n(để trống nếu mỗi dòng đã có sẵn cột nhóm bệnh):",
-            self.quick_nhom_benh_edit
-        )
-        quick_layout.addLayout(quick_form)
+        list_btn_row = QHBoxLayout()
+        self.refresh_rules_btn = QPushButton("Tải lại danh sách")
+        self.refresh_rules_btn.clicked.connect(self.refresh_rules_table)
+        self.delete_selected_btn = QPushButton("Xoá dòng đã chọn")
+        self.delete_selected_btn.clicked.connect(self.delete_selected_rule)
+        list_btn_row.addWidget(self.refresh_rules_btn)
+        list_btn_row.addWidget(self.delete_selected_btn)
+        list_layout.addLayout(list_btn_row)
 
-        self.quick_paste_edit = QTextEdit()
-        self.quick_paste_edit.setPlaceholderText(
-            "Dán danh sách mã bệnh vào đây, mỗi dòng 1 mã...\n"
-            "1.\tL55\tBỏng nắng\tBONG\n2.\tL55.0\tBỏng nắng độ một\tBONG"
-        )
-        self.quick_paste_edit.setMaximumHeight(140)
-        quick_layout.addWidget(self.quick_paste_edit)
+        self.rules_table = QTableWidget()
+        self.rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        list_layout.addWidget(self.rules_table)
 
-        self.quick_add_btn = QPushButton("Import danh sách đã dán vào CSDL quy tắc")
-        self.quick_add_btn.clicked.connect(self.run_quick_add)
-        quick_layout.addWidget(self.quick_add_btn)
-
-        quick_group.setLayout(quick_layout)
-        layout.addWidget(quick_group)
-
-        # --- Nhóm 2: Kiểm tra hồ sơ theo quy tắc ---
-        check_group = QGroupBox("2. Kiểm tra hồ sơ theo quy tắc")
-        check_form = QFormLayout()
-
-        self.check_source_combo = QComboBox()
-        self.check_source_combo.addItems(["File Excel", "CSDL SQLite ngoài (ví dụ XML1...)"])
-        self.check_source_combo.currentIndexChanged.connect(self.on_check_source_changed)
-        check_form.addRow("Nguồn dữ liệu hồ sơ:", self.check_source_combo)
-
-        # -- Nguồn: File Excel --
-        self.check_excel_widget = QWidget()
-        excel_layout = QVBoxLayout(self.check_excel_widget)
-        excel_layout.setContentsMargins(0, 0, 0, 0)
-        self.check_path_edit = QLineEdit()
-        browse_check_btn = QPushButton("Chọn file Excel hồ sơ...")
-        browse_check_btn.clicked.connect(self.browse_check_file)
-        row2 = QHBoxLayout()
-        row2.addWidget(self.check_path_edit)
-        row2.addWidget(browse_check_btn)
-        excel_layout.addLayout(row2)
-        check_form.addRow("File Excel hồ sơ:", self.check_excel_widget)
-
-        # -- Nguồn: CSDL SQLite ngoài --
-        self.check_db_widget = QWidget()
-        db_src_layout = QVBoxLayout(self.check_db_widget)
-        db_src_layout.setContentsMargins(0, 0, 0, 0)
-        self.check_db_path_edit = QLineEdit()
-        browse_check_db_btn = QPushButton("Chọn file CSDL SQLite ngoài...")
-        browse_check_db_btn.clicked.connect(self.browse_check_db)
-        row_db = QHBoxLayout()
-        row_db.addWidget(self.check_db_path_edit)
-        row_db.addWidget(browse_check_db_btn)
-        db_src_layout.addLayout(row_db)
-        self.check_db_table_combo = QComboBox()
-        db_src_layout.addWidget(self.check_db_table_combo)
-        check_form.addRow("CSDL SQLite ngoài:", self.check_db_widget)
-        self.check_db_widget.setVisible(False)
-
-        self.read_check_cols_btn = QPushButton("Đọc cột dữ liệu")
-        self.read_check_cols_btn.clicked.connect(self.load_check_columns)
-        check_form.addRow("", self.read_check_cols_btn)
-
-        self.check_col_ma_cp_combo = QComboBox()
-        check_form.addRow("Cột MA_CP:", self.check_col_ma_cp_combo)
-        self.check_col_ma_benh_combo = QComboBox()
-        check_form.addRow("Cột MA_BENH:", self.check_col_ma_benh_combo)
-        self.check_col_ma_benh_khac_combo = QComboBox()
-        check_form.addRow("Cột MA_BENH_KHAC:", self.check_col_ma_benh_khac_combo)
-        self.check_col_ma_chuyen_de_combo = QComboBox()
-        check_form.addRow("Cột Mã chuyên đề (nếu có):", self.check_col_ma_chuyen_de_combo)
-
-        self.prefix_match_check = QCheckBox(
-            "Khớp theo tiền tố mã bệnh (ví dụ mã gốc L55 trong quy tắc sẽ khớp cả L55.9 trong hồ sơ)"
-        )
-        check_form.addRow("", self.prefix_match_check)
-
-        self.ma_ly_do_tc_edit = QLineEdit("CHOT_3")
-        check_form.addRow("Mã lý do từ chối (MA_LY_DO_TC):", self.ma_ly_do_tc_edit)
-
-        self.ly_do_tc_edit = QLineEdit(DEFAULT_LY_DO_TC_TEMPLATE)
-        check_form.addRow("Nội dung lý do (LY_DO_TC):", self.ly_do_tc_edit)
-        ly_do_hint = QLabel(
-            "Có thể dùng các chỗ giữ chỗ: {MA_CP} {MA_BENH} {MA_BENH_KHAC} {NHOM_BENH} "
-            "{DANH_SACH_MA_BENH}"
-        )
-        ly_do_hint.setWordWrap(True)
-        ly_do_hint.setObjectName("noteLabel")
-        check_form.addRow("", ly_do_hint)
-
-        check_group.setLayout(check_form)
-        layout.addWidget(check_group)
-
-        btn_row = QHBoxLayout()
-        self.check_btn = QPushButton("Kiểm tra hồ sơ")
-        self.check_btn.setObjectName("primaryBtn")
-        self.check_btn.clicked.connect(self.run_check)
-        self.export_btn = QPushButton("Xuất dữ liệu SAI ra Excel")
-        self.export_btn.clicked.connect(self.export_violations)
-        self.export_btn.setEnabled(False)
-        btn_row.addWidget(self.check_btn)
-        btn_row.addWidget(self.export_btn)
-        layout.addLayout(btn_row)
+        list_group.setLayout(list_layout)
+        layout.addWidget(list_group, stretch=2)
 
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
@@ -2281,12 +2086,13 @@ class RuleAuditPage(QWidget):
         layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(140)
         layout.addWidget(self.log_box, stretch=1)
 
     def append_log(self, text):
         self.log_box.append(text)
 
-    # --- Nhóm 1: danh mục quy tắc ---
+    # --- Nhóm 1: nạp quy tắc bằng Excel ---
 
     def browse_rule_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2371,88 +2177,173 @@ class RuleAuditPage(QWidget):
             f"Đã nạp {so_dong} dòng quy tắc từ file.\n"
             f"Tổng số quy tắc hiện có trong CSDL: {tong_so}."
         )
+        self.refresh_rules_table()
 
     def on_rule_failed(self, msg):
         self.load_rules_btn.setEnabled(True)
         QMessageBox.critical(self, "Lỗi", msg)
 
-    # --- Nhóm 1b: import nhanh (dán danh sách) ---
+    # --- Nhóm 2: danh sách quy tắc hiện có (xem / xoá) ---
 
-    def run_quick_add(self):
-        ma_cd = self.quick_ma_cd_edit.text().strip()
-        ma_cp = self.quick_ma_cp_edit.text().strip()
-        if not ma_cd or not ma_cp:
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng nhập Mã chuyên đề và MA_CP.")
-            return
-
-        text = self.quick_paste_edit.toPlainText()
-        parsed = parse_pasted_benh_lines(text)
-        if not parsed:
-            QMessageBox.warning(
-                self, "Không đọc được dữ liệu",
-                "Không phân tích được dòng mã bệnh nào từ văn bản đã dán. Mỗi dòng cần "
-                "có ít nhất 1 mã bệnh, các cột cách nhau bởi Tab hoặc nhiều khoảng trắng."
+    def refresh_rules_table(self):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_rules_table(conn)
+            df = pd.read_sql_query(
+                "SELECT * FROM QUY_TAC_BENH ORDER BY MA_CHUYEN_DE, MA_CP, MA_BENH", conn
             )
-            return
+            conn.close()
+            self.rules_table_df = df
+            fill_table_widget(
+                self.rules_table, df,
+                ["MA_CHUYEN_DE", "TEN_CHUYEN_DE", "MA_CP", "TEN_CP", "MA_BENH", "TEN_BENH", "NHOM_BENH"]
+            )
+            self.append_log(f"Đã tải {len(df)} dòng quy tắc hiện có trong CSDL.")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách quy tắc:\n{e}")
 
-        preview = "\n".join(
-            f"- {p['MA_BENH']}  {p['TEN_BENH']}  "
-            f"[{self.quick_nhom_benh_edit.text().strip() or p['NHOM_BENH'] or '(không nhóm)'}]"
-            for p in parsed[:10]
-        )
-        more = f"\n... và {len(parsed) - 10} dòng khác" if len(parsed) > 10 else ""
+    def _get_selected_rule_row(self):
+        row_idx = self.rules_table.currentRow()
+        if row_idx < 0 or self.rules_table_df is None or row_idx >= len(self.rules_table_df):
+            QMessageBox.warning(self, "Chưa chọn dòng", "Vui lòng chọn 1 dòng quy tắc trong bảng trước.")
+            return None
+        return self.rules_table_df.iloc[row_idx]
+
+    def delete_selected_rule(self):
+        r = self._get_selected_rule_row()
+        if r is None:
+            return
         reply = QMessageBox.question(
-            self, "Xác nhận import",
-            f"Sẽ thêm {len(parsed)} mã bệnh cho MA_CHUYEN_DE={ma_cd}, MA_CP={ma_cp}:\n\n"
-            f"{preview}{more}\n\nTiếp tục?",
+            self, "Xác nhận xoá",
+            f"Xoá quy tắc:\nMã chuyên đề = {r['MA_CHUYEN_DE']}\nMA_CP = {r['MA_CP']}\n"
+            f"MA_BENH = {r['MA_BENH']}\n\nBạn có chắc chắn?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_rules_table(conn)
+            conn.execute(
+                "DELETE FROM QUY_TAC_BENH WHERE MA_CHUYEN_DE=? AND MA_CP=? AND MA_BENH=?",
+                (r["MA_CHUYEN_DE"], r["MA_CP"], r["MA_BENH"])
+            )
+            conn.commit()
+            conn.close()
+            self.append_log(
+                f"Đã xoá quy tắc: {r['MA_CHUYEN_DE']} / {r['MA_CP']} / {r['MA_BENH']}."
+            )
+            self.refresh_rules_table()
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không xoá được quy tắc:\n{e}")
 
-        self.quick_add_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.log_box.clear()
 
-        self.quick_worker = QuickAddRuleWorker(
-            ma_cd, self.quick_ten_cd_edit.text().strip(),
-            ma_cp, self.quick_ten_cp_edit.text().strip(),
-            self.quick_nhom_benh_edit.text().strip(),
-            parsed
+# ============================================================
+# TRANG 6: KIỂM TRA HỒ SƠ THEO QUY TẮC GIÁM ĐỊNH
+# ============================================================
+
+class RuleCheckPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.check_file_columns = []
+        self.violations_df = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        layout.addWidget(page_title("Kiểm tra hồ sơ theo quy tắc giám định"))
+        note = QLabel(
+            "Rà soát hàng loạt hồ sơ theo quy tắc đã định nghĩa ở trang '🛠 Quản lý quy tắc "
+            "giám định'. Dữ liệu được đọc trực tiếp từ 1 CSDL SQLite ngoài (ví dụ "
+            "xml123.sqlite) và việc xác định dòng SAI được thực hiện bằng 1 câu lệnh SQL "
+            "duy nhất (đối chiếu bảng dữ liệu với bảng quy tắc), không lặp qua từng dòng "
+            "bằng Python — phù hợp với dữ liệu lớn. Nếu MA_CP được dùng nhưng cả MA_BENH "
+            "và MA_BENH_KHAC (nhiều mã cách nhau bởi dấu ';') đều KHÔNG thuộc danh sách mã "
+            "bệnh cho phép, hồ sơ đó bị coi là chỉ định SAI quy định."
         )
-        self.quick_worker.log.connect(self.append_log)
-        self.quick_worker.progress.connect(self.progress.setValue)
-        self.quick_worker.finished_ok.connect(self.on_quick_add_done)
-        self.quick_worker.failed.connect(self.on_quick_add_failed)
-        self.quick_worker.start()
+        note.setWordWrap(True)
+        note.setObjectName("noteLabel")
+        layout.addWidget(note)
 
-    def on_quick_add_done(self, so_dong, tong_so):
-        self.quick_add_btn.setEnabled(True)
-        QMessageBox.information(
-            self, "Hoàn tất",
-            f"Đã thêm {so_dong} dòng quy tắc.\nTổng số quy tắc hiện có trong CSDL: {tong_so}."
+        # --- Nhóm 1: Nguồn dữ liệu CSDL SQLite & khai báo cột ---
+        check_group = QGroupBox("1. Nguồn dữ liệu CSDL SQLite ngoài & khai báo cột")
+        check_form = QFormLayout()
+
+        self.check_db_path_edit = QLineEdit()
+        browse_check_db_btn = QPushButton("Chọn file CSDL SQLite ngoài...")
+        browse_check_db_btn.clicked.connect(self.browse_check_db)
+        row_db = QHBoxLayout()
+        row_db.addWidget(self.check_db_path_edit)
+        row_db.addWidget(browse_check_db_btn)
+        check_form.addRow("File CSDL SQLite (ví dụ xml123.sqlite):", row_db)
+
+        self.check_db_table_combo = QComboBox()
+        check_form.addRow("Bảng dữ liệu:", self.check_db_table_combo)
+
+        self.read_check_cols_btn = QPushButton("Đọc cột dữ liệu")
+        self.read_check_cols_btn.clicked.connect(self.load_check_columns)
+        check_form.addRow("", self.read_check_cols_btn)
+
+        self.check_col_ma_cp_combo = QComboBox()
+        check_form.addRow("Cột MA_CP:", self.check_col_ma_cp_combo)
+        self.check_col_ma_benh_combo = QComboBox()
+        check_form.addRow("Cột MA_BENH:", self.check_col_ma_benh_combo)
+        self.check_col_ma_benh_khac_combo = QComboBox()
+        check_form.addRow("Cột MA_BENH_KHAC:", self.check_col_ma_benh_khac_combo)
+        self.check_col_ma_chuyen_de_combo = QComboBox()
+        check_form.addRow("Cột Mã chuyên đề (nếu có):", self.check_col_ma_chuyen_de_combo)
+
+        self.ma_ly_do_tc_edit = QLineEdit("CHOT_3")
+        check_form.addRow("Mã lý do từ chối (MA_LY_DO_TC):", self.ma_ly_do_tc_edit)
+
+        self.ly_do_tc_edit = QLineEdit(DEFAULT_LY_DO_TC_TEMPLATE)
+        check_form.addRow("Nội dung lý do (LY_DO_TC):", self.ly_do_tc_edit)
+        ly_do_hint = QLabel(
+            "Có thể dùng các chỗ giữ chỗ: {MA_CP} {MA_BENH} {MA_BENH_KHAC} {NHOM_BENH} "
+            "{DANH_SACH_MA_BENH}"
         )
+        ly_do_hint.setWordWrap(True)
+        ly_do_hint.setObjectName("noteLabel")
+        check_form.addRow("", ly_do_hint)
 
-    def on_quick_add_failed(self, msg):
-        self.quick_add_btn.setEnabled(True)
-        QMessageBox.critical(self, "Lỗi", msg)
+        check_group.setLayout(check_form)
+        layout.addWidget(check_group)
 
-    # --- Nhóm 2: kiểm tra hồ sơ ---
-
-    def on_check_source_changed(self, idx):
-        is_sqlite = (idx == 1)
-        self.check_excel_widget.setVisible(not is_sqlite)
-        self.check_db_widget.setVisible(is_sqlite)
-
-    def browse_check_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn file Excel hồ sơ cần kiểm tra", "",
-            "Excel/CSV (*.xlsx *.xls *.csv);;Tất cả file (*.*)"
+        output_hint = QLabel(
+            "Kết quả xuất Excel sẽ chuẩn hoá đủ 25 cột: XML1_ID, MA_BN, MA_LK, HO_TEN, "
+            "MA_THE, MA_BENH, NGAY_VAO, NGAY_RA, LOAI_CP, ID_CP, NGAY_Y_LENH, MA_CP, TEN_CP, "
+            "SO_DANG_KY, SL_DC, DON_GIA_DC, TYLE_TT_DC, MUC_HUONG_DC, LY_DO_TC, MA_LY_DO_TC, "
+            "MA_CSKCB, KY_QT, T_BHTT_DTL, MA_CHUYEN_DE, CONG_VAN (giống hệt cấu trúc cột của "
+            "chức năng Tra cứu dữ liệu XML1). Cột nào nguồn dữ liệu không có sẽ để trống."
         )
-        if not path:
-            return
-        self.check_path_edit.setText(path)
-        self.load_check_columns()
+        output_hint.setWordWrap(True)
+        output_hint.setObjectName("noteLabel")
+        layout.addWidget(output_hint)
+
+        btn_row = QHBoxLayout()
+        self.check_btn = QPushButton("Kiểm tra hồ sơ")
+        self.check_btn.setObjectName("primaryBtn")
+        self.check_btn.clicked.connect(self.run_check)
+        self.export_btn = QPushButton("Xuất dữ liệu SAI ra Excel")
+        self.export_btn.clicked.connect(self.export_violations)
+        self.export_btn.setEnabled(False)
+        btn_row.addWidget(self.check_btn)
+        btn_row.addWidget(self.export_btn)
+        layout.addLayout(btn_row)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+
+        layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box, stretch=1)
+
+    def append_log(self, text):
+        self.log_box.append(text)
 
     def browse_check_db(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2475,33 +2366,23 @@ class RuleAuditPage(QWidget):
             QMessageBox.critical(self, "Lỗi", f"Không thể đọc danh sách bảng:\n{e}")
 
     def load_check_columns(self):
-        is_sqlite = (self.check_source_combo.currentIndex() == 1)
+        db_path = self.check_db_path_edit.text().strip()
+        table = self.check_db_table_combo.currentText().strip()
+        if not db_path or not table:
+            QMessageBox.warning(
+                self, "Thiếu thông tin",
+                "Vui lòng chọn file CSDL SQLite và bảng dữ liệu trước."
+            )
+            return
         try:
-            if is_sqlite:
-                db_path = self.check_db_path_edit.text().strip()
-                table = self.check_db_table_combo.currentText().strip()
-                if not db_path or not table:
-                    QMessageBox.warning(
-                        self, "Thiếu thông tin",
-                        "Vui lòng chọn file CSDL SQLite và bảng dữ liệu trước."
-                    )
-                    return
-                conn = sqlite3.connect(db_path)
-                cur = conn.execute(f'PRAGMA table_info("{table}")')
-                columns = [row[1] for row in cur.fetchall()]
-                cur2 = conn.execute(f'SELECT COUNT(*) FROM "{table}"')
-                row_count = cur2.fetchone()[0]
-                conn.close()
-                self.check_file_columns = columns
-                self.append_log(f"Đã đọc {len(columns)} cột, {row_count} dòng từ bảng '{table}'.")
-            else:
-                path = self.check_path_edit.text().strip()
-                if not path:
-                    QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file hồ sơ trước.")
-                    return
-                df = read_table_any(path)
-                self.check_file_columns = list(df.columns)
-                self.append_log(f"Đã đọc {len(self.check_file_columns)} cột, {len(df)} dòng từ file hồ sơ.")
+            conn = sqlite3.connect(db_path)
+            cur = conn.execute(f'PRAGMA table_info("{table}")')
+            columns = [row[1] for row in cur.fetchall()]
+            cur2 = conn.execute(f'SELECT COUNT(*) FROM "{table}"')
+            row_count = cur2.fetchone()[0]
+            conn.close()
+            self.check_file_columns = columns
+            self.append_log(f"Đã đọc {len(columns)} cột, {row_count} dòng từ bảng '{table}'.")
 
             def fill_combo(combo, guesses, allow_none=False):
                 combo.clear()
@@ -2522,22 +2403,14 @@ class RuleAuditPage(QWidget):
             QMessageBox.critical(self, "Lỗi", f"Không đọc được cột dữ liệu:\n{e}")
 
     def run_check(self):
-        is_sqlite = (self.check_source_combo.currentIndex() == 1)
-        input_path, src_db_path, src_table_name = None, None, None
-        if is_sqlite:
-            src_db_path = self.check_db_path_edit.text().strip()
-            src_table_name = self.check_db_table_combo.currentText().strip()
-            if not src_db_path or not os.path.isfile(src_db_path):
-                QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file CSDL SQLite hợp lệ.")
-                return
-            if not src_table_name:
-                QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn bảng dữ liệu.")
-                return
-        else:
-            input_path = self.check_path_edit.text().strip()
-            if not input_path or not os.path.isfile(input_path):
-                QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file hồ sơ hợp lệ.")
-                return
+        src_db_path = self.check_db_path_edit.text().strip()
+        src_table_name = self.check_db_table_combo.currentText().strip()
+        if not src_db_path or not os.path.isfile(src_db_path):
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file CSDL SQLite hợp lệ.")
+            return
+        if not src_table_name:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn bảng dữ liệu.")
+            return
 
         col_ma_cp = self.check_col_ma_cp_combo.currentText().strip()
         if not col_ma_cp:
@@ -2561,10 +2434,9 @@ class RuleAuditPage(QWidget):
         self.log_box.clear()
 
         self.check_worker = RuleCheckWorker(
-            "sqlite" if is_sqlite else "excel", input_path, src_db_path, src_table_name,
+            src_db_path, src_table_name,
             col_ma_cp, col_ma_benh, col_ma_benh_khac,
             self.check_col_ma_chuyen_de_combo.currentText().strip(),
-            self.prefix_match_check.isChecked(),
             ma_ly_do_tc, ly_do_tc_template,
         )
         self.check_worker.log.connect(self.append_log)
@@ -2614,6 +2486,70 @@ class RuleAuditPage(QWidget):
 # ============================================================
 # GIAO DIỆN CHÍNH - MENU HIỆN ĐẠI (SIDEBAR)
 # ============================================================
+# GIAO DIỆN CHÍNH - THEO SKILL "pyqt6-ui-designer"
+# (Modern Enterprise Design System - xem references/design_tokens.md)
+# ============================================================
+
+# --- Design tokens (Light Mode) ---
+FONT_HEADING = "Hanken Grotesk"
+FONT_BODY = "Inter"
+FONT_HEADING_STACK = f"'{FONT_HEADING}', 'Segoe UI', sans-serif"
+FONT_BODY_STACK = f"'{FONT_BODY}', 'Segoe UI', sans-serif"
+
+# Surfaces
+COLOR_BACKGROUND = "#faf9ff"
+COLOR_SURFACE_LOWEST = "#ffffff"
+COLOR_SURFACE_LOW = "#f1f3ff"
+COLOR_SURFACE = "#e9edff"
+COLOR_SURFACE_HIGH = "#e1e8ff"
+COLOR_SURFACE_HIGHEST = "#d8e2ff"
+COLOR_SURFACE_VARIANT = "#d8e2ff"
+
+# Content
+COLOR_ON_SURFACE = "#051a3e"
+COLOR_ON_SURFACE_VARIANT = "#434654"
+COLOR_OUTLINE = "#737685"
+COLOR_OUTLINE_VARIANT = "#c3c6d6"
+
+# Primary (Corporate Blue)
+COLOR_PRIMARY = "#003d9b"
+COLOR_ON_PRIMARY = "#ffffff"
+COLOR_PRIMARY_CONTAINER = "#0052cc"
+COLOR_ON_PRIMARY_CONTAINER = "#c4d2ff"
+COLOR_PRIMARY_FIXED = "#dae2ff"
+COLOR_PRIMARY_FIXED_DIM = "#b2c5ff"
+
+# Error / Danger
+COLOR_ERROR = "#ba1a1a"
+COLOR_ON_ERROR = "#ffffff"
+COLOR_ERROR_CONTAINER = "#ffdad6"
+COLOR_ON_ERROR_CONTAINER = "#93000a"
+
+# Semantic
+COLOR_SUCCESS = "#1e7d4a"
+COLOR_SUCCESS_BG = "#d1fae5"
+
+# Inverse (dùng cho khung log dạng console)
+COLOR_INVERSE_SURFACE = "#1d3054"
+COLOR_INVERSE_ON_SURFACE = "#edf0ff"
+
+# Spacing (4px grid)
+SPACING_XS = 4
+SPACING_SM = 8
+SPACING_MD = 16
+SPACING_LG = 24
+SPACING_XL = 32
+
+# Radius
+RADIUS_SM = 2
+RADIUS_DEFAULT = 4
+RADIUS_MD = 6
+RADIUS_LG = 8
+RADIUS_XL = 12
+RADIUS_FULL = 9999
+
+SIDEBAR_WIDTH = 260
+
 
 def page_title(text: str) -> QLabel:
     lbl = QLabel(text)
@@ -2621,144 +2557,282 @@ def page_title(text: str) -> QLabel:
     return lbl
 
 
-APP_STYLE = """
-QWidget {
-    font-family: "Segoe UI", "Roboto", sans-serif;
-    font-size: 13px;
-    color: #1f2937;
-}
-QMainWindow, #contentArea {
-    background-color: #eef6fb;
-}
-#sidebar {
-    background-color: #0066a3;
-}
-#sidebar QListWidget {
-    background-color: #0066a3;
-    border: none;
-    outline: 0;
-    padding-top: 8px;
-}
-#sidebar QListWidget::item {
-    color: #d6ecf9;
-    padding: 14px 20px;
-    border-left: 4px solid transparent;
-}
-#sidebar QListWidget::item:selected {
-    background-color: #008acd;
-    color: #ffffff;
-    border-left: 4px solid #ffffff;
-}
-#sidebar QListWidget::item:hover:!selected {
-    background-color: #00588c;
-}
-#appTitle {
-    color: #ffffff;
-    font-size: 16px;
+APP_STYLE = f"""
+/* ─── Global Reset ─────────────────────────────── */
+QWidget {{
+    font-family: {FONT_BODY_STACK};
+    font-size: 14px;
+    color: {COLOR_ON_SURFACE};
+    outline: none;
+}}
+QMainWindow, #contentArea {{
+    background-color: {COLOR_BACKGROUND};
+}}
+
+/* ─── Scrollbars ────────────────────────────────── */
+QScrollBar:vertical {{
+    width: 8px;
+    background: transparent;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {COLOR_OUTLINE_VARIANT};
+    border-radius: 4px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {COLOR_OUTLINE};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+
+/* ─── Sidebar ───────────────────────────────────── */
+#sidebar {{
+    background-color: {COLOR_SURFACE};
+    border-right: 1px solid {COLOR_OUTLINE_VARIANT};
+}}
+#appTitle {{
+    font-family: {FONT_HEADING_STACK};
+    font-size: 18px;
     font-weight: 600;
-    padding: 18px 20px 6px 20px;
-}
-#appSubtitle {
-    color: #bfe1f5;
+    letter-spacing: -0.01em;
+    color: {COLOR_ON_SURFACE};
+    padding: {SPACING_LG}px {SPACING_MD}px {SPACING_XS}px {SPACING_MD}px;
+}}
+#appSubtitle {{
     font-size: 11px;
-    padding: 0 20px 16px 20px;
-    border-bottom: 1px solid #00588c;
-}
-#pageTitle {
-    font-size: 19px;
     font-weight: 600;
-    color: #0066a3;
-    padding-bottom: 4px;
-}
-#noteLabel {
-    color: #044e77;
-    background-color: #e3f3fb;
-    border: 1px solid #99d6f0;
-    border-radius: 6px;
-    padding: 8px 10px;
-}
-QGroupBox {
-    background-color: #ffffff;
-    border: 1px solid #cfe8f6;
-    border-radius: 8px;
-    margin-top: 10px;
-    padding: 12px;
-    font-weight: 600;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
-    color: #0066a3;
-}
-QLineEdit, QComboBox {
-    background-color: #ffffff;
-    border: 1px solid #b9dcef;
-    border-radius: 6px;
-    padding: 5px 8px;
-    min-height: 22px;
-}
-QLineEdit:focus, QComboBox:focus {
-    border: 1px solid #008acd;
-}
-QPushButton {
-    background-color: #e3f3fb;
+    letter-spacing: 0.05em;
+    color: {COLOR_ON_SURFACE_VARIANT};
+    padding: 0 {SPACING_MD}px {SPACING_LG}px {SPACING_MD}px;
+}}
+#sidebarNavItem {{
+    background: transparent;
     border: none;
-    border-radius: 6px;
-    padding: 7px 14px;
-    color: #0066a3;
+    border-left: 3px solid transparent;
+    border-radius: 0;
+    text-align: left;
+    padding: {SPACING_SM}px {SPACING_MD}px;
+    color: {COLOR_ON_SURFACE_VARIANT};
+    font-size: 14px;
     font-weight: 500;
-}
-QPushButton:hover {
-    background-color: #cbe9f7;
-}
-QPushButton:disabled {
-    background-color: #f3f4f6;
-    color: #9ca3af;
-}
-QPushButton#primaryBtn {
-    background-color: #008acd;
-    color: #ffffff;
+    min-height: 40px;
+}}
+#sidebarNavItem:hover {{
+    background-color: {COLOR_SURFACE_HIGH};
+    color: {COLOR_ON_SURFACE};
+}}
+#sidebarNavItem[active="true"] {{
+    background-color: {COLOR_PRIMARY_FIXED};
+    color: {COLOR_PRIMARY};
+    border-left: 3px solid {COLOR_PRIMARY};
+    font-weight: 700;
+}}
+#sidebarNavItem[active="true"]:hover {{
+    background-color: {COLOR_PRIMARY_FIXED};
+}}
+
+/* ─── Buttons ───────────────────────────────────── */
+QPushButton {{
+    font-family: {FONT_BODY_STACK};
+    font-size: 12px;
     font-weight: 600;
-}
-QPushButton#primaryBtn:hover {
-    background-color: #0066a3;
-}
-QPushButton#primaryBtn:disabled {
-    background-color: #9ed4ee;
-    color: #f0f9ff;
-}
-QTableWidget {
-    background-color: #ffffff;
-    border: 1px solid #cfe8f6;
-    border-radius: 6px;
-    gridline-color: #eef6fb;
-}
-QHeaderView::section {
-    background-color: #e3f3fb;
-    color: #0066a3;
-    padding: 6px;
+    letter-spacing: 0.05em;
+    padding: {SPACING_SM}px {SPACING_MD}px;
+    border-radius: {RADIUS_DEFAULT}px;
+    border: 1px solid {COLOR_OUTLINE_VARIANT};
+    background-color: {COLOR_SURFACE_LOWEST};
+    color: {COLOR_ON_SURFACE};
+}}
+QPushButton:hover {{
+    background-color: {COLOR_SURFACE_LOW};
+    border-color: {COLOR_OUTLINE};
+}}
+QPushButton:pressed {{
+    background-color: {COLOR_SURFACE};
+}}
+QPushButton:disabled {{
+    color: {COLOR_OUTLINE_VARIANT};
+    border-color: {COLOR_OUTLINE_VARIANT};
+    background-color: {COLOR_SURFACE_LOW};
+}}
+QPushButton#primaryBtn {{
+    background-color: {COLOR_PRIMARY};
+    color: {COLOR_ON_PRIMARY};
     border: none;
-    border-bottom: 1px solid #cfe8f6;
+}}
+QPushButton#primaryBtn:hover {{
+    background-color: {COLOR_PRIMARY_CONTAINER};
+}}
+QPushButton#primaryBtn:pressed {{
+    background-color: {COLOR_PRIMARY};
+}}
+QPushButton#primaryBtn:disabled {{
+    background-color: {COLOR_OUTLINE_VARIANT};
+    color: {COLOR_SURFACE_LOWEST};
+}}
+
+/* ─── Inputs (QLineEdit/QComboBox) ──────────────── */
+QLineEdit, QComboBox {{
+    font-family: {FONT_BODY_STACK};
+    font-size: 14px;
+    background-color: {COLOR_SURFACE_LOWEST};
+    border: 1px solid {COLOR_OUTLINE_VARIANT};
+    border-radius: {RADIUS_SM}px;
+    padding: {SPACING_SM}px {SPACING_MD}px;
+    color: {COLOR_ON_SURFACE};
+    selection-background-color: {COLOR_PRIMARY_FIXED};
+    selection-color: {COLOR_PRIMARY};
+}}
+QLineEdit:focus, QComboBox:focus {{
+    border: 2px solid {COLOR_PRIMARY};
+}}
+QLineEdit:disabled {{
+    background-color: {COLOR_SURFACE_LOW};
+    color: {COLOR_OUTLINE};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: {SPACING_LG}px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {COLOR_SURFACE_LOWEST};
+    border: 1px solid {COLOR_OUTLINE_VARIANT};
+    border-radius: {RADIUS_MD}px;
+    padding: {SPACING_XS}px;
+    selection-background-color: {COLOR_PRIMARY_FIXED};
+    selection-color: {COLOR_PRIMARY};
+    outline: none;
+}}
+QComboBox QAbstractItemView::item {{
+    padding: {SPACING_SM}px {SPACING_MD}px;
+    border-radius: {RADIUS_DEFAULT}px;
+    min-height: 28px;
+}}
+QComboBox QAbstractItemView::item:hover {{
+    background-color: {COLOR_SURFACE_LOW};
+}}
+
+/* ─── QCheckBox ─────────────────────────────────── */
+QCheckBox {{
+    spacing: {SPACING_SM}px;
+    color: {COLOR_ON_SURFACE};
+    font-size: 14px;
+}}
+QCheckBox::indicator {{
+    width: 18px; height: 18px;
+    border: 2px solid {COLOR_OUTLINE};
+    border-radius: {RADIUS_SM}px;
+    background: {COLOR_SURFACE_LOWEST};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {COLOR_PRIMARY};
+    border-color: {COLOR_PRIMARY};
+}}
+QCheckBox::indicator:hover {{
+    border-color: {COLOR_PRIMARY};
+}}
+
+/* ─── QLabel ────────────────────────────────────── */
+#pageTitle {{
+    font-family: {FONT_HEADING_STACK};
+    font-size: 24px;
     font-weight: 600;
-}
-QProgressBar {
-    background-color: #dceefa;
-    border-radius: 6px;
+    letter-spacing: -0.01em;
+    color: {COLOR_ON_SURFACE};
+    padding-bottom: {SPACING_XS}px;
+}}
+#noteLabel {{
+    color: {COLOR_ON_SURFACE_VARIANT};
+    background-color: {COLOR_PRIMARY_FIXED};
+    border: 1px solid {COLOR_PRIMARY_FIXED_DIM};
+    border-radius: {RADIUS_MD}px;
+    padding: {SPACING_SM}px {SPACING_MD}px;
+}}
+
+/* ─── QGroupBox (dùng như thẻ "card") ───────────── */
+QGroupBox {{
+    background-color: {COLOR_SURFACE_LOWEST};
+    border: 1px solid {COLOR_OUTLINE_VARIANT};
+    border-radius: {RADIUS_LG}px;
+    margin-top: 12px;
+    padding: {SPACING_MD}px;
+    font-family: {FONT_HEADING_STACK};
+    font-weight: 600;
+    font-size: 15px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: {SPACING_SM}px;
+    padding: 0 {SPACING_XS}px;
+    color: {COLOR_PRIMARY};
+}}
+
+/* ─── QTableWidget / QHeaderView ────────────────── */
+QTableWidget {{
+    background-color: {COLOR_SURFACE_LOWEST};
+    border: 1px solid {COLOR_OUTLINE_VARIANT};
+    border-radius: {RADIUS_LG}px;
+    gridline-color: {COLOR_OUTLINE_VARIANT};
+    alternate-background-color: {COLOR_SURFACE_LOW};
+    selection-background-color: {COLOR_PRIMARY_FIXED};
+    selection-color: {COLOR_ON_SURFACE};
+    outline: none;
+    font-size: 13px;
+}}
+QTableWidget::item {{
+    padding: 0 {SPACING_MD}px;
+    min-height: 36px;
+    border-bottom: 1px solid {COLOR_OUTLINE_VARIANT};
+}}
+QTableWidget::item:selected {{
+    background-color: {COLOR_PRIMARY_FIXED};
+    color: {COLOR_ON_SURFACE};
+}}
+QHeaderView::section {{
+    background-color: {COLOR_SURFACE_LOW};
+    color: {COLOR_ON_SURFACE_VARIANT};
+    font-family: {FONT_BODY_STACK};
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 0 {SPACING_MD}px;
+    height: 34px;
+    border: none;
+    border-right: 1px solid {COLOR_OUTLINE_VARIANT};
+    border-bottom: 1px solid {COLOR_OUTLINE_VARIANT};
+}}
+QHeaderView::section:last {{ border-right: none; }}
+
+/* ─── QProgressBar ──────────────────────────────── */
+QProgressBar {{
+    background-color: {COLOR_SURFACE_HIGH};
+    border-radius: 2px;
+    border: none;
+    height: 6px;
     text-align: center;
-    height: 16px;
-}
-QProgressBar::chunk {
-    background-color: #008acd;
-    border-radius: 6px;
-}
-QTextEdit {
-    background-color: #04324d;
-    color: #d6ecf9;
-    border-radius: 6px;
-    padding: 6px;
+}}
+QProgressBar::chunk {{
+    background-color: {COLOR_PRIMARY};
+    border-radius: 2px;
+}}
+
+/* ─── Khung log dạng console (mọi QTextEdit trong app đều là khung log) ─ */
+QTextEdit {{
+    background-color: {COLOR_INVERSE_SURFACE};
+    color: {COLOR_INVERSE_ON_SURFACE};
+    border: none;
+    border-radius: {RADIUS_MD}px;
+    padding: {SPACING_SM}px;
     font-family: Consolas, monospace;
-}
+    font-size: 12px;
+    selection-background-color: {COLOR_PRIMARY_CONTAINER};
+}}
+
+/* ─── QMessageBox ───────────────────────────────── */
+QMessageBox {{
+    background-color: {COLOR_SURFACE_LOWEST};
+}}
 """
 
 
@@ -2766,7 +2840,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Phần mềm nghiệp vụ BHYT - Giám định XML1")
-        self.resize(1250, 820)
+        self.resize(1280, 840)
 
         central = QWidget()
         central.setObjectName("contentArea")
@@ -2774,37 +2848,36 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # --- Sidebar ---
+        # --- Sidebar (theo component_library.md: SidebarNav) ---
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(260)
+        sidebar.setFixedWidth(SIDEBAR_WIDTH)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setContentsMargins(0, SPACING_SM, 0, SPACING_MD)
         sidebar_layout.setSpacing(0)
 
-        title = QLabel("BHYT - GIÁM ĐỊNH")
+        title = QLabel("BHYT · GIÁM ĐỊNH")
         title.setObjectName("appTitle")
-        subtitle = QLabel("Công cụ xử lý dữ liệu XML1")
+        subtitle = QLabel("CÔNG CỤ XỬ LÝ DỮ LIỆU XML1")
         subtitle.setObjectName("appSubtitle")
         sidebar_layout.addWidget(title)
         sidebar_layout.addWidget(subtitle)
 
-        self.menu_list = QListWidget()
-        self.menu_list.setSpacing(2)
         menu_items = [
-            "🔎  Tra cứu dữ liệu XML1",
-            "🗂  Tách Excel theo MA_CSKCB",
-            "📊  Tổng hợp trừ chi phí theo chuyên đề",
-            "💾  Lưu hồ sơ đã trừ & Kiểm tra trùng",
-            "⚖️  Quy tắc giám định theo chuyên đề",
+            ("🔎", "Tra cứu dữ liệu XML1"),
+            ("🗂", "Tách Excel theo MA_CSKCB"),
+            ("📊", "Tổng hợp trừ chi phí theo chuyên đề"),
+            ("💾", "Lưu hồ sơ đã trừ & Kiểm tra trùng"),
+            ("🛠", "Quản lý quy tắc giám định"),
+            ("🚨", "Kiểm tra hồ sơ theo quy tắc"),
         ]
-        for text in menu_items:
-            item = QListWidgetItem(text)
-            item.setSizeHint(item.sizeHint())
-            self.menu_list.addItem(item)
-        self.menu_list.currentRowChanged.connect(self.change_page)
-        sidebar_layout.addWidget(self.menu_list, stretch=1)
+        self._nav_buttons = []
+        for icon, label in menu_items:
+            btn = self._make_nav_button(icon, label)
+            sidebar_layout.addWidget(btn)
+            self._nav_buttons.append(btn)
 
+        sidebar_layout.addStretch()
         root_layout.addWidget(sidebar)
 
         # --- Content stack ---
@@ -2813,15 +2886,47 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(SplitPage())
         self.stack.addWidget(ExcludeSummaryPage())
         self.stack.addWidget(SaveDeductedPage())
-        self.stack.addWidget(RuleAuditPage())
+        self.stack.addWidget(RuleManagePage())
+        self.stack.addWidget(RuleCheckPage())
         root_layout.addWidget(self.stack, stretch=1)
 
         self.setCentralWidget(central)
-        self.menu_list.setCurrentRow(0)
+        self._set_active_index(0)
 
-    def change_page(self, index):
-        if index >= 0:
-            self.stack.setCurrentIndex(index)
+    def _make_nav_button(self, icon: str, label: str) -> QPushButton:
+        btn = QPushButton()
+        btn.setObjectName("sidebarNavItem")
+        btn.setProperty("active", False)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(44)
+
+        row = QHBoxLayout(btn)
+        row.setContentsMargins(SPACING_MD, 0, SPACING_MD, 0)
+        row.setSpacing(SPACING_SM + SPACING_XS)
+
+        icon_lbl = QLabel(icon)
+        icon_lbl.setFixedWidth(22)
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        text_lbl = QLabel(label)
+        text_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        text_lbl.setWordWrap(False)
+
+        row.addWidget(icon_lbl)
+        row.addWidget(text_lbl)
+        row.addStretch()
+
+        idx = len(self._nav_buttons) if hasattr(self, "_nav_buttons") else 0
+        btn.clicked.connect(lambda checked=False, i=idx: self._set_active_index(i))
+        return btn
+
+    def _set_active_index(self, index: int):
+        self.stack.setCurrentIndex(index)
+        for i, btn in enumerate(self._nav_buttons):
+            btn.setProperty("active", i == index)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
 
 
 def main():
