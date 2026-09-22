@@ -275,6 +275,44 @@ def upsert_rules(conn, rules_df: pd.DataFrame) -> int:
     return cur.fetchone()[0]
 
 
+TOPIC_DEF_COLUMNS = [
+    "MA_CHUYEN_DE", "TEN_CHUYEN_DE", "TEN_SHEET",
+    "DANH_SACH_COT", "NOI_DUNG_CANH_BAO", "DIEU_KIEN_SQL",
+]
+
+
+def ensure_topic_defs_table(conn):
+    """
+    Đảm bảo bảng DINH_NGHIA_CHUYEN_DE tồn tại trong CSDL dùng chung (DB_PATH).
+    Đây là dạng quy tắc TỔNG QUÁT hơn QUY_TAC_BENH: mỗi chuyên đề lưu nguyên
+    1 điều kiện SQL (WHERE) tự viết, áp dụng được cho bất kỳ tiêu chí nào
+    (số lượng, đơn giá, danh sách MA_CP, so sánh...), không chỉ riêng mã bệnh.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS DINH_NGHIA_CHUYEN_DE (
+            MA_CHUYEN_DE TEXT PRIMARY KEY,
+            TEN_CHUYEN_DE TEXT,
+            TEN_SHEET TEXT,
+            DANH_SACH_COT TEXT,
+            NOI_DUNG_CANH_BAO TEXT,
+            DIEU_KIEN_SQL TEXT
+        )
+    """)
+    conn.commit()
+
+
+def upsert_topic_def(conn, row: dict):
+    """Thêm mới hoặc cập nhật (nếu trùng MA_CHUYEN_DE) 1 định nghĩa chuyên đề."""
+    ensure_topic_defs_table(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO DINH_NGHIA_CHUYEN_DE "
+        "(MA_CHUYEN_DE, TEN_CHUYEN_DE, TEN_SHEET, DANH_SACH_COT, NOI_DUNG_CANH_BAO, DIEU_KIEN_SQL) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        tuple(row.get(c, "") for c in TOPIC_DEF_COLUMNS)
+    )
+    conn.commit()
+
+
 def fill_table_widget(table: QTableWidget, df: pd.DataFrame, columns, max_rows=1000):
     table.setColumnCount(len(columns))
     table.setHorizontalHeaderLabels(columns)
@@ -1701,6 +1739,147 @@ class RuleCheckWorker(QThread):
 
 
 # ============================================================
+# WORKER: NẠP ĐỊNH NGHĨA CHUYÊN ĐỀ (DẠNG ĐIỀU KIỆN SQL) TỪ EXCEL
+# ============================================================
+
+class TopicDefLoadWorker(QThread):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(int, int)  # số dòng nạp, tổng số chuyên đề trong CSDL
+    failed = pyqtSignal(str)
+
+    def __init__(self, input_path, col_ma_cd, col_ten_cd, col_ten_sheet,
+                 col_danh_sach_cot, col_noi_dung_canh_bao, col_dieu_kien_sql):
+        super().__init__()
+        self.input_path = input_path
+        self.col_ma_cd = col_ma_cd
+        self.col_ten_cd = col_ten_cd
+        self.col_ten_sheet = col_ten_sheet
+        self.col_danh_sach_cot = col_danh_sach_cot
+        self.col_noi_dung_canh_bao = col_noi_dung_canh_bao
+        self.col_dieu_kien_sql = col_dieu_kien_sql
+
+    def run(self):
+        try:
+            self.log.emit("Đang đọc file Excel định nghĩa chuyên đề...")
+            df = read_table_any(self.input_path)
+            self.progress.emit(20)
+
+            for c, label in [(self.col_ma_cd, "Mã chuyên đề"), (self.col_dieu_kien_sql, "Điều kiện SQL")]:
+                if c not in df.columns:
+                    raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
+
+            def get_col(colname):
+                if colname and colname != NONE_OPTION and colname in df.columns:
+                    return df[colname].fillna("").astype(str).str.strip()
+                return pd.Series([""] * len(df), index=df.index)
+
+            defs = pd.DataFrame({
+                "MA_CHUYEN_DE": get_col(self.col_ma_cd).str.upper(),
+                "TEN_CHUYEN_DE": get_col(self.col_ten_cd),
+                "TEN_SHEET": get_col(self.col_ten_sheet),
+                "DANH_SACH_COT": get_col(self.col_danh_sach_cot),
+                "NOI_DUNG_CANH_BAO": get_col(self.col_noi_dung_canh_bao),
+                "DIEU_KIEN_SQL": get_col(self.col_dieu_kien_sql),
+            })
+            before_n = len(defs)
+            defs = defs[(defs["MA_CHUYEN_DE"] != "") & (defs["DIEU_KIEN_SQL"] != "")]
+            defs = defs.drop_duplicates(subset=["MA_CHUYEN_DE"], keep="last")
+            if len(defs) < before_n:
+                self.log.emit(
+                    f"Đã bỏ qua {before_n - len(defs)} dòng thiếu Mã chuyên đề/Điều kiện SQL "
+                    "hoặc trùng lặp ngay trong file."
+                )
+            if defs.empty:
+                raise ValueError("Không có dòng định nghĩa chuyên đề hợp lệ nào để nạp.")
+            self.progress.emit(50)
+
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                ensure_topic_defs_table(conn)
+                for _, r in defs.iterrows():
+                    upsert_topic_def(conn, r.to_dict())
+                cur = conn.execute("SELECT COUNT(*) FROM DINH_NGHIA_CHUYEN_DE")
+                total_after = cur.fetchone()[0]
+            finally:
+                conn.close()
+
+            self.progress.emit(100)
+            self.log.emit(
+                f"Hoàn tất. Đã nạp {len(defs)} chuyên đề từ file. "
+                f"Tổng số chuyên đề hiện có trong CSDL: {total_after}."
+            )
+            self.finished_ok.emit(len(defs), total_after)
+
+        except Exception as e:
+            self.log.emit("LỖI: " + str(e))
+            self.log.emit(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+# ============================================================
+# WORKER: CHẠY CHUYÊN ĐỀ THEO KỲ (KY_QT) TRÊN CSDL SQLITE NGOÀI
+# ============================================================
+
+class TopicRunWorker(QThread):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(object)  # dict {sheet_name: DataFrame}
+    failed = pyqtSignal(str)
+
+    def __init__(self, src_db_path, src_table_name, col_ky_qt, ky_qt_value, topic_rows):
+        super().__init__()
+        self.src_db_path = src_db_path
+        self.src_table_name = src_table_name
+        self.col_ky_qt = col_ky_qt
+        self.ky_qt_value = ky_qt_value
+        self.topic_rows = topic_rows  # list các dict định nghĩa chuyên đề đã chọn
+
+    def run(self):
+        try:
+            if not self.topic_rows:
+                raise ValueError("Vui lòng chọn ít nhất 1 chuyên đề để chạy.")
+
+            conn = sqlite3.connect(self.src_db_path)
+            results = {}
+            total = len(self.topic_rows)
+
+            for i, topic in enumerate(self.topic_rows, start=1):
+                ma_cd = topic["MA_CHUYEN_DE"]
+                dieu_kien = topic["DIEU_KIEN_SQL"]
+                cot = (topic.get("DANH_SACH_COT") or "").strip()
+                select_cols = cot if cot else "*"
+                sheet_name = (topic.get("TEN_SHEET") or "").strip() or ma_cd
+                sheet_name = re.sub(r'[\\/*?:\[\]]', "_", sheet_name)[:31] or ma_cd[:31]
+
+                sql = (
+                    f'SELECT {select_cols} FROM "{self.src_table_name}" '
+                    f'WHERE "{self.col_ky_qt}" = ? AND ({dieu_kien})'
+                )
+                self.log.emit(f"[{ma_cd}] Đang chạy: {sql}  (kỳ = {self.ky_qt_value})")
+                try:
+                    df = pd.read_sql_query(sql, conn, params=(self.ky_qt_value,))
+                except Exception as e:
+                    raise ValueError(f"Lỗi khi chạy chuyên đề '{ma_cd}': {e}") from e
+
+                noi_dung = topic.get("NOI_DUNG_CANH_BAO") or ""
+                if noi_dung:
+                    df["NOI_DUNG_CANH_BAO"] = noi_dung
+
+                results[sheet_name] = df
+                self.log.emit(f"[{ma_cd}] -> {len(df)} dòng, sheet '{sheet_name}'.")
+                self.progress.emit(int(i / total * 100))
+
+            conn.close()
+            self.finished_ok.emit(results)
+
+        except Exception as e:
+            self.log.emit("LỖI: " + str(e))
+            self.log.emit(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+# ============================================================
 # TRANG 4: LƯU HỒ SƠ ĐÃ TRỪ VÀO CSDL & KIỂM TRA TRÙNG
 # ============================================================
 
@@ -2484,7 +2663,532 @@ class RuleCheckPage(QWidget):
 
 
 # ============================================================
-# GIAO DIỆN CHÍNH - MENU HIỆN ĐẠI (SIDEBAR)
+# TRANG 7: ĐỊNH NGHĨA CHUYÊN ĐỀ (ĐIỀU KIỆN SQL TUỲ Ý)
+# ============================================================
+
+class TopicManagePage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.topic_file_columns = []
+        self.topics_table_df = None
+        self._build_ui()
+        self.refresh_topics_table()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        layout.addWidget(page_title("Định nghĩa chuyên đề (điều kiện SQL)"))
+        note = QLabel(
+            "Dùng cho các chuyên đề mà quy tắc không phải là danh sách mã bệnh, mà là 1 "
+            "điều kiện SQL tuỳ ý (so sánh số lượng, đơn giá, danh sách MA_CP...) — ví dụ: "
+            "\"SO_LUONG_BV > 2 AND MA_CP in ('05C.224.8', ...)\". Mỗi chuyên đề gồm: mã, "
+            "tên, điều kiện SQL (không cần viết KY_QT, phần mềm tự thêm khi chạy ở trang "
+            "'▶️ Chạy chuyên đề theo kỳ'), nội dung cảnh báo và tên sheet khi xuất Excel."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("noteLabel")
+        layout.addWidget(note)
+
+        # --- Nhóm 1: Thêm / cập nhật 1 chuyên đề (nhập tay) ---
+        form_group = QGroupBox("1. Thêm / cập nhật 1 chuyên đề")
+        form = QFormLayout()
+
+        self.def_ma_cd_edit = QLineEdit()
+        form.addRow("Mã chuyên đề:", self.def_ma_cd_edit)
+        self.def_ten_cd_edit = QLineEdit()
+        form.addRow("Tên chuyên đề:", self.def_ten_cd_edit)
+        self.def_ten_sheet_edit = QLineEdit()
+        form.addRow("Tên sheet khi xuất Excel:", self.def_ten_sheet_edit)
+        self.def_cot_edit = QLineEdit()
+        self.def_cot_edit.setPlaceholderText("Để trống = lấy tất cả cột (*)")
+        form.addRow("Danh sách cột cần lấy (tuỳ chọn):", self.def_cot_edit)
+        self.def_canh_bao_edit = QLineEdit()
+        form.addRow("Nội dung cảnh báo:", self.def_canh_bao_edit)
+
+        self.def_dieu_kien_edit = QTextEdit()
+        self.def_dieu_kien_edit.setObjectName("sqlInputArea")
+        self.def_dieu_kien_edit.setPlaceholderText(
+            'Ví dụ:\nSO_LUONG_BV > 2 AND MA_CP in ("05C.224.8","05C.224.121","HD.150")'
+        )
+        self.def_dieu_kien_edit.setMaximumHeight(110)
+        form.addRow("Điều kiện SQL (WHERE, không kèm KY_QT):", self.def_dieu_kien_edit)
+
+        form_group.setLayout(form)
+        layout.addWidget(form_group)
+
+        self.save_def_btn = QPushButton("Lưu chuyên đề")
+        self.save_def_btn.setObjectName("primaryBtn")
+        self.save_def_btn.clicked.connect(self.run_save_def)
+        layout.addWidget(self.save_def_btn)
+
+        # --- Nhóm 2: Nạp hàng loạt bằng Excel ---
+        excel_group = QGroupBox("2. Nạp hàng loạt bằng file Excel (tuỳ chọn)")
+        excel_form = QFormLayout()
+        self.topic_path_edit = QLineEdit()
+        browse_topic_btn = QPushButton("Chọn file Excel...")
+        browse_topic_btn.clicked.connect(self.browse_topic_file)
+        row1 = QHBoxLayout()
+        row1.addWidget(self.topic_path_edit)
+        row1.addWidget(browse_topic_btn)
+        excel_form.addRow("File Excel định nghĩa chuyên đề:", row1)
+
+        self.read_topic_cols_btn = QPushButton("Đọc cột của file")
+        self.read_topic_cols_btn.clicked.connect(self.load_topic_columns)
+        excel_form.addRow("", self.read_topic_cols_btn)
+
+        self.topic_col_ma_cd_combo = QComboBox()
+        excel_form.addRow("Cột Mã chuyên đề:", self.topic_col_ma_cd_combo)
+        self.topic_col_ten_cd_combo = QComboBox()
+        excel_form.addRow("Cột Tên chuyên đề (nếu có):", self.topic_col_ten_cd_combo)
+        self.topic_col_ten_sheet_combo = QComboBox()
+        excel_form.addRow("Cột Tên sheet (nếu có):", self.topic_col_ten_sheet_combo)
+        self.topic_col_cot_combo = QComboBox()
+        excel_form.addRow("Cột Danh sách cột lấy (nếu có):", self.topic_col_cot_combo)
+        self.topic_col_canh_bao_combo = QComboBox()
+        excel_form.addRow("Cột Nội dung cảnh báo (nếu có):", self.topic_col_canh_bao_combo)
+        self.topic_col_dieu_kien_combo = QComboBox()
+        excel_form.addRow("Cột Điều kiện SQL:", self.topic_col_dieu_kien_combo)
+
+        excel_group.setLayout(excel_form)
+        layout.addWidget(excel_group)
+
+        self.load_topics_btn = QPushButton("Nạp / Cập nhật từ Excel vào CSDL")
+        self.load_topics_btn.clicked.connect(self.run_load_topics)
+        layout.addWidget(self.load_topics_btn)
+
+        db_info = QLabel(
+            f"📁 Chuyên đề được lưu vào bảng DINH_NGHIA_CHUYEN_DE trong CSDL DÙNG CHUNG "
+            f"của toàn phần mềm: {DB_PATH}\n"
+            "Lưu/nạp trùng Mã chuyên đề sẽ tự động CẬP NHẬT thay vì tạo bản ghi trùng."
+        )
+        db_info.setWordWrap(True)
+        db_info.setObjectName("noteLabel")
+        layout.addWidget(db_info)
+
+        # --- Nhóm 3: Danh sách chuyên đề hiện có ---
+        list_group = QGroupBox("3. Danh sách chuyên đề hiện có")
+        list_layout = QVBoxLayout()
+        list_btn_row = QHBoxLayout()
+        self.refresh_topics_btn = QPushButton("Tải lại danh sách")
+        self.refresh_topics_btn.clicked.connect(self.refresh_topics_table)
+        self.delete_topic_btn = QPushButton("Xoá dòng đã chọn")
+        self.delete_topic_btn.clicked.connect(self.delete_selected_topic)
+        list_btn_row.addWidget(self.refresh_topics_btn)
+        list_btn_row.addWidget(self.delete_topic_btn)
+        list_layout.addLayout(list_btn_row)
+
+        self.topics_table = QTableWidget()
+        self.topics_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.topics_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        list_layout.addWidget(self.topics_table)
+        list_group.setLayout(list_layout)
+        layout.addWidget(list_group, stretch=2)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+
+        layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(140)
+        layout.addWidget(self.log_box, stretch=1)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    # --- Nhóm 1: thêm/cập nhật thủ công ---
+
+    def run_save_def(self):
+        ma_cd = self.def_ma_cd_edit.text().strip().upper()
+        dieu_kien = self.def_dieu_kien_edit.toPlainText().strip()
+        if not ma_cd or not dieu_kien:
+            QMessageBox.warning(
+                self, "Thiếu thông tin",
+                "Vui lòng nhập Mã chuyên đề và Điều kiện SQL."
+            )
+            return
+        row = {
+            "MA_CHUYEN_DE": ma_cd,
+            "TEN_CHUYEN_DE": self.def_ten_cd_edit.text().strip(),
+            "TEN_SHEET": self.def_ten_sheet_edit.text().strip(),
+            "DANH_SACH_COT": self.def_cot_edit.text().strip(),
+            "NOI_DUNG_CANH_BAO": self.def_canh_bao_edit.text().strip(),
+            "DIEU_KIEN_SQL": dieu_kien,
+        }
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            upsert_topic_def(conn, row)
+            conn.close()
+            self.append_log(f"Đã lưu chuyên đề '{ma_cd}'.")
+            QMessageBox.information(self, "Thành công", f"Đã lưu chuyên đề '{ma_cd}'.")
+            self.refresh_topics_table()
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không lưu được chuyên đề:\n{e}")
+
+    # --- Nhóm 2: nạp Excel ---
+
+    def browse_topic_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file Excel định nghĩa chuyên đề", "",
+            "Excel/CSV (*.xlsx *.xls *.csv);;Tất cả file (*.*)"
+        )
+        if not path:
+            return
+        self.topic_path_edit.setText(path)
+        self.load_topic_columns()
+
+    def load_topic_columns(self):
+        path = self.topic_path_edit.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel trước.")
+            return
+        try:
+            df = read_table_any(path)
+            self.topic_file_columns = list(df.columns)
+
+            def fill_combo(combo, guesses, allow_none=False):
+                combo.clear()
+                if allow_none:
+                    combo.addItem(NONE_OPTION)
+                combo.addItems(self.topic_file_columns)
+                for g in guesses:
+                    if g in self.topic_file_columns:
+                        combo.setCurrentText(g)
+                        return g
+                return None
+
+            fill_combo(self.topic_col_ma_cd_combo, ["MA_CHUYEN_DE"])
+            fill_combo(self.topic_col_ten_cd_combo, ["TEN_CHUYEN_DE"], allow_none=True)
+            fill_combo(self.topic_col_ten_sheet_combo, ["TEN_SHEET"], allow_none=True)
+            fill_combo(self.topic_col_cot_combo, ["DANH_SACH_COT"], allow_none=True)
+            fill_combo(self.topic_col_canh_bao_combo, ["NOI_DUNG_CANH_BAO"], allow_none=True)
+            fill_combo(self.topic_col_dieu_kien_combo, ["DIEU_KIEN_SQL"])
+
+            self.append_log(f"Đã đọc {len(self.topic_file_columns)} cột, {len(df)} dòng từ file.")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không đọc được file:\n{e}")
+
+    def run_load_topics(self):
+        path = self.topic_path_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel hợp lệ.")
+            return
+        col_ma_cd = self.topic_col_ma_cd_combo.currentText().strip()
+        col_dieu_kien = self.topic_col_dieu_kien_combo.currentText().strip()
+        if not col_ma_cd or not col_dieu_kien:
+            QMessageBox.warning(
+                self, "Thiếu thông tin",
+                "Vui lòng chọn đủ cột Mã chuyên đề và Điều kiện SQL."
+            )
+            return
+
+        self.load_topics_btn.setEnabled(False)
+        self.progress.setValue(0)
+        self.log_box.clear()
+
+        self.topic_worker = TopicDefLoadWorker(
+            path, col_ma_cd,
+            self.topic_col_ten_cd_combo.currentText().strip(),
+            self.topic_col_ten_sheet_combo.currentText().strip(),
+            self.topic_col_cot_combo.currentText().strip(),
+            self.topic_col_canh_bao_combo.currentText().strip(),
+            col_dieu_kien,
+        )
+        self.topic_worker.log.connect(self.append_log)
+        self.topic_worker.progress.connect(self.progress.setValue)
+        self.topic_worker.finished_ok.connect(self.on_topics_loaded)
+        self.topic_worker.failed.connect(self.on_topic_load_failed)
+        self.topic_worker.start()
+
+    def on_topics_loaded(self, so_dong, tong_so):
+        self.load_topics_btn.setEnabled(True)
+        QMessageBox.information(
+            self, "Hoàn tất",
+            f"Đã nạp {so_dong} chuyên đề từ file.\nTổng số hiện có: {tong_so}."
+        )
+        self.refresh_topics_table()
+
+    def on_topic_load_failed(self, msg):
+        self.load_topics_btn.setEnabled(True)
+        QMessageBox.critical(self, "Lỗi", msg)
+
+    # --- Nhóm 3: danh sách hiện có ---
+
+    def refresh_topics_table(self):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_topic_defs_table(conn)
+            df = pd.read_sql_query(
+                "SELECT * FROM DINH_NGHIA_CHUYEN_DE ORDER BY MA_CHUYEN_DE", conn
+            )
+            conn.close()
+            self.topics_table_df = df
+            fill_table_widget(self.topics_table, df, TOPIC_DEF_COLUMNS)
+            self.append_log(f"Đã tải {len(df)} chuyên đề hiện có trong CSDL.")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách chuyên đề:\n{e}")
+
+    def delete_selected_topic(self):
+        row_idx = self.topics_table.currentRow()
+        if row_idx < 0 or self.topics_table_df is None or row_idx >= len(self.topics_table_df):
+            QMessageBox.warning(self, "Chưa chọn dòng", "Vui lòng chọn 1 dòng trong bảng trước.")
+            return
+        r = self.topics_table_df.iloc[row_idx]
+        reply = QMessageBox.question(
+            self, "Xác nhận xoá",
+            f"Xoá chuyên đề '{r['MA_CHUYEN_DE']}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_topic_defs_table(conn)
+            conn.execute("DELETE FROM DINH_NGHIA_CHUYEN_DE WHERE MA_CHUYEN_DE = ?", (r["MA_CHUYEN_DE"],))
+            conn.commit()
+            conn.close()
+            self.append_log(f"Đã xoá chuyên đề '{r['MA_CHUYEN_DE']}'.")
+            self.refresh_topics_table()
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không xoá được:\n{e}")
+
+
+# ============================================================
+# TRANG 8: CHẠY CHUYÊN ĐỀ THEO KỲ
+# ============================================================
+
+class TopicRunPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.src_columns = []
+        self.topic_defs_df = None
+        self.results = None  # dict {sheet_name: df}
+        self._build_ui()
+        self.refresh_topic_list()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        layout.addWidget(page_title("Chạy chuyên đề theo kỳ"))
+        note = QLabel(
+            "Chọn CSDL nguồn, chọn 1 hoặc nhiều chuyên đề đã định nghĩa ở trang '🧩 Định "
+            "nghĩa chuyên đề', chọn kỳ quyết toán (KY_QT/tháng), rồi bấm Chạy — không cần "
+            "viết lại code cho từng chuyên đề. Kết quả xuất ra 1 file Excel nhiều sheet, "
+            "mỗi chuyên đề 1 sheet, kèm cột NOI_DUNG_CANH_BAO."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("noteLabel")
+        layout.addWidget(note)
+
+        # --- Nhóm 1: Nguồn dữ liệu ---
+        src_group = QGroupBox("1. Nguồn dữ liệu CSDL SQLite (ví dụ xml123.sqlite)")
+        src_form = QFormLayout()
+
+        self.src_db_path_edit = QLineEdit()
+        browse_src_btn = QPushButton("Chọn file CSDL SQLite...")
+        browse_src_btn.clicked.connect(self.browse_src_db)
+        row1 = QHBoxLayout()
+        row1.addWidget(self.src_db_path_edit)
+        row1.addWidget(browse_src_btn)
+        src_form.addRow("File CSDL:", row1)
+
+        self.src_table_combo = QComboBox()
+        src_form.addRow("Bảng dữ liệu:", self.src_table_combo)
+
+        self.read_src_cols_btn = QPushButton("Đọc cột & tải danh sách kỳ")
+        self.read_src_cols_btn.clicked.connect(self.load_src_columns)
+        src_form.addRow("", self.read_src_cols_btn)
+
+        self.col_ky_qt_combo = QComboBox()
+        src_form.addRow("Cột KY_QT:", self.col_ky_qt_combo)
+
+        self.ky_qt_value_combo = QComboBox()
+        self.ky_qt_value_combo.setEditable(True)
+        src_form.addRow("Kỳ quyết toán / Tháng:", self.ky_qt_value_combo)
+
+        src_group.setLayout(src_form)
+        layout.addWidget(src_group)
+
+        # --- Nhóm 2: Chọn chuyên đề ---
+        topic_group = QGroupBox("2. Chọn chuyên đề cần chạy")
+        topic_layout = QVBoxLayout()
+        topic_btn_row = QHBoxLayout()
+        self.refresh_topic_list_btn = QPushButton("Tải lại danh sách chuyên đề")
+        self.refresh_topic_list_btn.clicked.connect(self.refresh_topic_list)
+        topic_btn_row.addWidget(self.refresh_topic_list_btn)
+        topic_layout.addLayout(topic_btn_row)
+
+        self.topic_list = QTableWidget()
+        self.topic_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.topic_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.topic_list.setMaximumHeight(220)
+        topic_layout.addWidget(QLabel("Giữ Ctrl (hoặc kéo chọn) để chọn nhiều chuyên đề:"))
+        topic_layout.addWidget(self.topic_list)
+        topic_group.setLayout(topic_layout)
+        layout.addWidget(topic_group)
+
+        btn_row = QHBoxLayout()
+        self.run_btn = QPushButton("Chạy")
+        self.run_btn.setObjectName("primaryBtn")
+        self.run_btn.clicked.connect(self.run_topics)
+        self.export_btn = QPushButton("Xuất kết quả ra Excel")
+        self.export_btn.clicked.connect(self.export_results)
+        self.export_btn.setEnabled(False)
+        btn_row.addWidget(self.run_btn)
+        btn_row.addWidget(self.export_btn)
+        layout.addLayout(btn_row)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+
+        layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box, stretch=1)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def browse_src_db(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file CSDL SQLite nguồn", "",
+            "SQLite Database (*.sqlite *.sqlite3 *.db);;Tất cả file (*.*)"
+        )
+        if not path:
+            return
+        self.src_db_path_edit.setText(path)
+        try:
+            conn = sqlite3.connect(path)
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            tables = [r[0] for r in cur.fetchall()]
+            conn.close()
+            self.src_table_combo.clear()
+            self.src_table_combo.addItems(tables)
+            self.append_log(f"Đã tìm thấy {len(tables)} bảng trong CSDL.")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không thể đọc danh sách bảng:\n{e}")
+
+    def load_src_columns(self):
+        db_path = self.src_db_path_edit.text().strip()
+        table = self.src_table_combo.currentText().strip()
+        if not db_path or not table:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file CSDL và bảng dữ liệu.")
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.execute(f'PRAGMA table_info("{table}")')
+            columns = [row[1] for row in cur.fetchall()]
+            self.src_columns = columns
+
+            self.col_ky_qt_combo.clear()
+            self.col_ky_qt_combo.addItems(columns)
+            if "KY_QT" in columns:
+                self.col_ky_qt_combo.setCurrentText("KY_QT")
+
+            ky_col = self.col_ky_qt_combo.currentText().strip()
+            self.ky_qt_value_combo.clear()
+            if ky_col:
+                try:
+                    vals_df = pd.read_sql_query(
+                        f'SELECT DISTINCT "{ky_col}" AS v FROM "{table}" ORDER BY v DESC', conn
+                    )
+                    vals = [str(v) for v in vals_df["v"].dropna().tolist()]
+                    self.ky_qt_value_combo.addItems(vals)
+                except Exception:
+                    pass
+            conn.close()
+            self.append_log(
+                f"Đã đọc {len(columns)} cột và {self.ky_qt_value_combo.count()} giá trị kỳ "
+                f"từ bảng '{table}'."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không đọc được dữ liệu:\n{e}")
+
+    def refresh_topic_list(self):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            ensure_topic_defs_table(conn)
+            df = pd.read_sql_query("SELECT * FROM DINH_NGHIA_CHUYEN_DE ORDER BY MA_CHUYEN_DE", conn)
+            conn.close()
+            self.topic_defs_df = df
+            fill_table_widget(
+                self.topic_list, df,
+                ["MA_CHUYEN_DE", "TEN_CHUYEN_DE", "TEN_SHEET", "NOI_DUNG_CANH_BAO"]
+            )
+            self.append_log(f"Đã tải {len(df)} chuyên đề khả dụng.")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách chuyên đề:\n{e}")
+
+    def run_topics(self):
+        db_path = self.src_db_path_edit.text().strip()
+        table = self.src_table_combo.currentText().strip()
+        if not db_path or not os.path.isfile(db_path):
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file CSDL SQLite hợp lệ.")
+            return
+        if not table:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn bảng dữ liệu.")
+            return
+        col_ky_qt = self.col_ky_qt_combo.currentText().strip()
+        ky_qt_value = self.ky_qt_value_combo.currentText().strip()
+        if not col_ky_qt or not ky_qt_value:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn cột KY_QT và kỳ cần chạy.")
+            return
+
+        selected_rows = sorted({idx.row() for idx in self.topic_list.selectedIndexes()})
+        if not selected_rows or self.topic_defs_df is None:
+            QMessageBox.warning(self, "Chưa chọn chuyên đề", "Vui lòng chọn ít nhất 1 chuyên đề.")
+            return
+        topic_rows = [self.topic_defs_df.iloc[i].to_dict() for i in selected_rows]
+
+        self.run_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.progress.setValue(0)
+        self.log_box.clear()
+
+        self.run_worker = TopicRunWorker(db_path, table, col_ky_qt, ky_qt_value, topic_rows)
+        self.run_worker.log.connect(self.append_log)
+        self.run_worker.progress.connect(self.progress.setValue)
+        self.run_worker.finished_ok.connect(self.on_run_done)
+        self.run_worker.failed.connect(self.on_run_failed)
+        self.run_worker.start()
+
+    def on_run_done(self, results):
+        self.results = results
+        self.run_btn.setEnabled(True)
+        total_rows = sum(len(df) for df in results.values())
+        self.export_btn.setEnabled(total_rows > 0)
+        QMessageBox.information(
+            self, "Hoàn tất",
+            f"Đã chạy {len(results)} chuyên đề, tổng {total_rows} dòng kết quả.\n"
+            + "\n".join(f"- {name}: {len(df)} dòng" for name, df in results.items())
+        )
+
+    def on_run_failed(self, msg):
+        self.run_btn.setEnabled(True)
+        QMessageBox.critical(self, "Lỗi", msg)
+
+    def export_results(self):
+        if not self.results:
+            QMessageBox.warning(self, "Không có dữ liệu", "Chưa có kết quả để xuất.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Lưu kết quả chuyên đề", "ket_qua_chuyen_de.xlsx", "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                for sheet_name, df in self.results.items():
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+            QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
+
+
 # ============================================================
 # GIAO DIỆN CHÍNH - THEO SKILL "pyqt6-ui-designer"
 # (Modern Enterprise Design System - xem references/design_tokens.md)
@@ -2817,7 +3521,7 @@ QProgressBar::chunk {{
     border-radius: 2px;
 }}
 
-/* ─── Khung log dạng console (mọi QTextEdit trong app đều là khung log) ─ */
+/* ─── Khung log dạng console (mặc định cho QTextEdit) ───── */
 QTextEdit {{
     background-color: {COLOR_INVERSE_SURFACE};
     color: {COLOR_INVERSE_ON_SURFACE};
@@ -2827,6 +3531,17 @@ QTextEdit {{
     font-family: Consolas, monospace;
     font-size: 12px;
     selection-background-color: {COLOR_PRIMARY_CONTAINER};
+}}
+/* ─── Khung nhập liệu dạng văn bản dài (ví dụ điều kiện SQL) ─ */
+QTextEdit#sqlInputArea {{
+    background-color: {COLOR_SURFACE_LOWEST};
+    color: {COLOR_ON_SURFACE};
+    border: 1px solid {COLOR_OUTLINE_VARIANT};
+    font-family: Consolas, monospace;
+    font-size: 13px;
+}}
+QTextEdit#sqlInputArea:focus {{
+    border: 2px solid {COLOR_PRIMARY};
 }}
 
 /* ─── QMessageBox ───────────────────────────────── */
@@ -2870,6 +3585,8 @@ class MainWindow(QMainWindow):
             ("💾", "Lưu hồ sơ đã trừ & Kiểm tra trùng"),
             ("🛠", "Quản lý quy tắc giám định"),
             ("🚨", "Kiểm tra hồ sơ theo quy tắc"),
+            ("🧩", "Định nghĩa chuyên đề (SQL)"),
+            ("▶️", "Chạy chuyên đề theo kỳ"),
         ]
         self._nav_buttons = []
         for icon, label in menu_items:
@@ -2888,6 +3605,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(SaveDeductedPage())
         self.stack.addWidget(RuleManagePage())
         self.stack.addWidget(RuleCheckPage())
+        self.stack.addWidget(TopicManagePage())
+        self.stack.addWidget(TopicRunPage())
         root_layout.addWidget(self.stack, stretch=1)
 
         self.setCentralWidget(central)

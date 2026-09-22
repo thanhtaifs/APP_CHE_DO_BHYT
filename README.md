@@ -4,14 +4,16 @@ Giao diện dạng **menu hiện đại (sidebar)** bên trái, nội dung từn
 thị bên phải, được thiết kế theo **Modern Enterprise Design System** (dùng skill
 `pyqt6-ui-designer`): nền sáng, sidebar màu xám-xanh nhạt với thanh chỉ báo mục
 đang chọn bên trái, thẻ nội dung (card) bo góc, màu chủ đạo xanh dương đậm
-**#003d9b**. Gồm 6 chức năng:
+**#003d9b**. Gồm 8 chức năng:
 
 1. 🔎 Tra cứu dữ liệu XML1 từ CSDL SQLite
 2. 🗂 Tách file Excel theo MA_CSKCB
 3. 📊 Tổng hợp trừ chi phí theo MA_CSKCB & Mã chuyên đề
 4. 💾 Lưu hồ sơ đã trừ vào CSDL & Kiểm tra trùng
-5. 🛠 Quản lý quy tắc giám định
-6. 🚨 Kiểm tra hồ sơ theo quy tắc
+5. 🛠 Quản lý quy tắc giám định (theo mã bệnh)
+6. 🚨 Kiểm tra hồ sơ theo quy tắc (theo mã bệnh)
+7. 🧩 Định nghĩa chuyên đề (điều kiện SQL tuỳ ý)
+8. ▶️ Chạy chuyên đề theo kỳ
 
 ## 1. Cài đặt
 
@@ -117,7 +119,7 @@ Khoá kiểm tra trùng: **(XML1_ID, ID_CP, Mã chuyên đề)**.
 đã từng lưu → **"Lưu vào CSDL"** để ghi các dòng mới (dòng trùng khoá tự động
 bị bỏ qua, không tạo bản ghi trùng dù bấm lưu nhiều lần).
 
-## 6. Chức năng "Quản lý quy tắc giám định"
+## 6. Chức năng "Quản lý quy tắc giám định" (theo mã bệnh)
 
 **Mục đích:** định nghĩa quy tắc "Mã chi phí (MA_CP) chỉ được chỉ định khi chẩn
 đoán bệnh thuộc 1 danh sách mã bệnh (ICD) cho phép", theo từng Mã chuyên đề, áp
@@ -158,7 +160,7 @@ làm mới; chọn 1 dòng rồi bấm **"Xoá dòng đã chọn"** để xoá h
 CSDL (có hỏi xác nhận). Muốn sửa nội dung 1 quy tắc, chỉnh lại trong file Excel
 rồi nạp lại (mục 1) — quy tắc trùng khoá sẽ tự cập nhật.
 
-## 7. Chức năng "Kiểm tra hồ sơ theo quy tắc"
+## 7. Chức năng "Kiểm tra hồ sơ theo quy tắc" (theo mã bệnh)
 
 Dùng quy tắc đã định nghĩa ở mục 6 để rà soát hàng loạt hồ sơ, tự động tìm ra
 các dòng chỉ định SAI, kèm mã và nội dung lý do từ chối.
@@ -227,34 +229,110 @@ MA_CHUYEN_DE, CONG_VAN
 - Riêng **`MA_LY_DO_TC`** và **`LY_DO_TC`** luôn được điền bằng giá trị vừa
   tính từ quy tắc (không lấy từ nguồn, kể cả khi nguồn có sẵn 2 cột này).
 
+## 8. Chức năng "Định nghĩa chuyên đề (điều kiện SQL tuỳ ý)"
 
-## 8. Ghi chú kỹ thuật
+Mục 6/7 chỉ xử lý được 1 dạng quy tắc: "MA_CP + danh sách mã bệnh cho phép".
+Nhiều chuyên đề giám định thực tế lại dựa trên **điều kiện hoàn toàn khác**
+(so sánh số lượng, đơn giá, danh sách mã chi phí...) — ví dụ chuyên đề "kế
+thừa thuốc vượt số lượng thực kê":
+
+```sql
+SO_LUONG_BV > 2 AND MA_CP in (
+    '05C.224.8','05C.224.121','05C.222.18','05C.223','05C.158.3',
+    'HD.224.121','HD.224.6','HD.158.3','HD.222.18','HD.150'
+)
+```
+
+Chức năng này cho phép lưu lại **nguyên văn điều kiện SQL** đó thành 1 "chuyên
+đề" có mã riêng, để sau này chỉ cần chọn lại mà không phải sửa code mỗi lần.
+
+**Mỗi chuyên đề gồm:**
+
+| Trường | Bắt buộc | Ý nghĩa |
+|---|---|---|
+| `MA_CHUYEN_DE` | Có | Mã định danh chuyên đề (khoá, ví dụ `KETHUA_THUOC`) |
+| `TEN_CHUYEN_DE` | Không | Tên hiển thị |
+| `TEN_SHEET` | Không | Tên sheet khi xuất Excel (mặc định dùng MA_CHUYEN_DE) |
+| `DANH_SACH_COT` | Không | Danh sách cột cần lấy, cách nhau dấu phẩy; để trống = lấy tất cả (`*`) |
+| `NOI_DUNG_CANH_BAO` | Không | Text sẽ tự điền vào cột `NOI_DUNG_CANH_BAO` của kết quả |
+| `DIEU_KIEN_SQL` | Có | Điều kiện SQL (phần sau `WHERE ... AND (`), **không cần viết điều kiện KY_QT** — phần mềm tự thêm khi chạy |
+
+**Cách nhập:**
+- **Thêm/cập nhật 1 chuyên đề**: điền form (có khung nhập nhiều dòng cho
+  `DIEU_KIEN_SQL`) → bấm "Lưu chuyên đề". Lưu trùng `MA_CHUYEN_DE` sẽ tự cập
+  nhật.
+- **Nạp hàng loạt bằng Excel** (tuỳ chọn): mỗi dòng 1 chuyên đề, đúng cột như
+  bảng trên → khai báo cột → "Nạp / Cập nhật từ Excel vào CSDL".
+- Bảng "Danh sách chuyên đề hiện có" cho xem/xoá.
+
+> Lưu vào bảng `DINH_NGHIA_CHUYEN_DE` trong `DB.sqlite` (CSDL dùng chung, khác
+> bảng `QUY_TAC_BENH` ở mục 6 — 2 hệ thống quy tắc độc lập, dùng cho 2 dạng
+> chuyên đề khác nhau).
+
+## 9. Chức năng "Chạy chuyên đề theo kỳ"
+
+Chạy các chuyên đề đã định nghĩa ở mục 8 trên dữ liệu thật, **chỉ cần chọn
+chuyên đề và kỳ (KY_QT/tháng)** — đúng như yêu cầu, không cần viết lại script
+Python cho từng chuyên đề như trước.
+
+**Cách dùng:**
+
+1. **Nguồn dữ liệu**: chọn file CSDL SQLite (ví dụ `xml123.sqlite`) → chọn
+   bảng → bấm "Đọc cột & tải danh sách kỳ". Phần mềm tự đọc danh sách cột và
+   truy vấn `SELECT DISTINCT` trên cột `KY_QT` để đổ vào ô "Kỳ quyết toán /
+   Tháng" dạng chọn nhanh (vẫn gõ tay được nếu kỳ chưa có trong danh sách).
+2. **Chọn chuyên đề**: bấm "Tải lại danh sách chuyên đề", giữ Ctrl để chọn
+   nhiều chuyên đề cùng lúc (chạy gộp nhiều chuyên đề trong 1 lần).
+3. Bấm **"Chạy"**. Với mỗi chuyên đề, phần mềm build câu lệnh:
+
+   ```sql
+   SELECT <DANH_SACH_COT hoặc *> FROM "<bảng>"
+   WHERE "<cột KY_QT>" = ? AND (<DIEU_KIEN_SQL của chuyên đề>)
+   ```
+
+   (giá trị kỳ được truyền qua tham số `?`, an toàn khỏi SQL injection), sau
+   đó tự thêm cột `NOI_DUNG_CANH_BAO` theo nội dung đã khai báo cho chuyên đề
+   đó.
+4. Bấm **"Xuất kết quả ra Excel"**: 1 file, **mỗi chuyên đề 1 sheet** (đặt tên
+   theo `TEN_SHEET`), đúng theo cách bạn đang tổ chức file (`sheets[sheet_name]
+   = DataOutput`).
+
+## 10. Ghi chú kỹ thuật
 
 - Các thao tác đọc CSDL, tra cứu, tách file, tổng hợp, lưu/kiểm tra trùng và
   kiểm tra quy tắc đều chạy trên luồng riêng (QThread) nên giao diện không bị
   treo khi xử lý file lớn.
 - Đối chiếu XML1_ID/ID_CP dùng `pandas.merge` (join toàn bộ dữ liệu một lần)
   thay vì truy vấn từng dòng, xử lý nhanh hơn với file lớn.
-- **CSDL dùng chung `DB.sqlite`**: gồm 2 bảng — `HO_SO_DA_TRU` (mục 5) và
-  `QUY_TAC_BENH` (mục 6, 7). Đường dẫn tính tự động và cố định qua hàm
-  `get_app_dir()` (biến `DB_PATH` ở đầu file `app_tra_cuu_xml1.py`): cùng thư
-  mục với file `.py` khi chạy script, hoặc cùng thư mục với file `.exe` khi đã
-  đóng gói (kiểm tra qua `sys.frozen`). Muốn đổi tên/vị trí file CSDL, chỉnh
-  biến `DB_PATH` này — mọi chức năng liên quan sẽ tự dùng theo.
-- CSDL nguồn dùng ở mục 2 (Tra cứu XML1) và CSDL ngoài chọn ở mục 7 (Kiểm tra
-  hồ sơ theo quy tắc) là dữ liệu **của riêng bạn**, do bạn tự chọn đường dẫn
-  mỗi lần — khác với `DB.sqlite` (CSDL nội bộ, cố định, do phần mềm quản lý).
+- **CSDL dùng chung `DB.sqlite`**: gồm 3 bảng — `HO_SO_DA_TRU` (mục 5),
+  `QUY_TAC_BENH` (mục 6, 7) và `DINH_NGHIA_CHUYEN_DE` (mục 8, 9). Đường dẫn
+  tính tự động và cố định qua hàm `get_app_dir()` (biến `DB_PATH` ở đầu file
+  `app_tra_cuu_xml1.py`): cùng thư mục với file `.py` khi chạy script, hoặc
+  cùng thư mục với file `.exe` khi đã đóng gói (kiểm tra qua `sys.frozen`).
+  Muốn đổi tên/vị trí file CSDL, chỉnh biến `DB_PATH` này — mọi chức năng
+  liên quan sẽ tự dùng theo.
+- CSDL nguồn dùng ở mục 2 (Tra cứu XML1), CSDL ngoài chọn ở mục 7 (Kiểm tra hồ
+  sơ theo quy tắc) và mục 9 (Chạy chuyên đề theo kỳ) là dữ liệu **của riêng
+  bạn**, do bạn tự chọn đường dẫn mỗi lần — khác với `DB.sqlite` (CSDL nội bộ,
+  cố định, do phần mềm quản lý).
 - Mục 7 dùng `sqlite3` `ATTACH DATABASE` để gộp 2 CSDL (nguồn + `DB.sqlite`)
   vào cùng 1 kết nối, cho phép JOIN/EXISTS trực tiếp bằng SQL giữa 2 file
   `.sqlite` khác nhau mà không cần nạp dữ liệu ra ngoài trước.
+- Mục 9 build câu lệnh SQL bằng cách nối trực tiếp `DIEU_KIEN_SQL` (do bạn tự
+  khai báo ở mục 8, được xem là đáng tin cậy vì do chính người quản trị nhập)
+  vào mệnh đề `WHERE`, riêng **giá trị kỳ (KY_QT) luôn được truyền qua tham số
+  `?`** (parameterized query) chứ không nối chuỗi trực tiếp, tránh lỗi cú
+  pháp/SQL injection từ giá trị chọn ở dropdown.
 - Kết quả xuất Excel của mục 7 (dữ liệu chỉ định sai) dùng chung danh sách cột
   `OUTPUT_COLUMNS` với chức năng Tra cứu XML1 (mục 2), để đảm bảo cấu trúc file
-  đồng nhất trong toàn phần mềm.
+  đồng nhất trong toàn phần mềm. Mục 9 thì giữ nguyên cột theo `DANH_SACH_COT`
+  hoặc toàn bộ cột của bảng nguồn (không ép theo `OUTPUT_COLUMNS`), vì mỗi
+  chuyên đề SQL có thể cần bộ cột khác nhau.
 - Muốn đổi danh sách cột đầu ra hoặc mapping mã loại KCB, chỉnh các biến
   `OUTPUT_COLUMNS`, `COLUMNS_NOT_IN_DB` và hàm `classify_loai_ho_so()` ở đầu
   file `app_tra_cuu_xml1.py`.
 
-## 9. Giao diện (Design System)
+## 11. Giao diện (Design System)
 
 Giao diện được viết theo skill **`pyqt6-ui-designer`** (Modern Enterprise
 Design System — xem `references/design_tokens.md`, `qss_patterns.md`,
