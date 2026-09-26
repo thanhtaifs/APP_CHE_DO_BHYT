@@ -10,10 +10,10 @@ thị bên phải, được thiết kế theo **Modern Enterprise Design System*
 2. 🗂 Tách file Excel theo MA_CSKCB
 3. 📊 Tổng hợp trừ chi phí theo MA_CSKCB & Mã chuyên đề
 4. 💾 Lưu hồ sơ đã trừ vào CSDL & Kiểm tra trùng
-5. 🛠 Quản lý quy tắc giám định (theo mã bệnh)
-6. 🚨 Kiểm tra hồ sơ theo quy tắc (theo mã bệnh)
-7. 🧩 Định nghĩa chuyên đề (điều kiện SQL tuỳ ý)
-8. ▶️ Chạy chuyên đề theo kỳ
+5. 🧩 Định nghĩa chuyên đề (điều kiện SQL)
+6. ▶️ Chạy chuyên đề theo kỳ
+7. 📁 Ghép Folder Excel -> Nhiều Sheet
+8. 📑 Ghép Nhiều Sheet -> 1 Sheet
 
 ## 1. Cài đặt
 
@@ -22,7 +22,7 @@ pip install -r requirements.txt
 ```
 
 Giữ 3 file sau **cùng 1 thư mục**: `app_tra_cuu_xml1.py`, `requirements.txt`,
-và `DB.sqlite` (CSDL dùng chung, đã tạo sẵn 2 bảng rỗng — xem mục 5 và 6/7). Nếu
+và `DB.sqlite` (CSDL dùng chung, đã tạo sẵn 2 bảng rỗng — xem mục 4, 5). Nếu
 thiếu file `DB.sqlite`, phần mềm sẽ tự tạo lại khi dùng lần đầu, nên không bắt
 buộc phải có sẵn.
 
@@ -38,8 +38,7 @@ python app_tra_cuu_xml1.py
 
 Bạn có sẵn danh sách `XML1_ID` (hoặc `XML1_ID` + `ID_CP`) trong 1 file Excel/CSV,
 phần mềm đọc ngược vào CSDL SQLite nguồn **do bạn tự chọn đường dẫn** (dữ liệu
-gốc của bạn, ví dụ "xml123...", khác với `DB.sqlite` dùng chung của phần mềm)
-để lấy đầy đủ các cột:
+gốc của bạn, khác với `DB.sqlite` dùng chung của phần mềm) để lấy đầy đủ các cột:
 
 ```
 XML1_ID, MA_BN, MA_LK, HO_TEN, MA_THE, MA_BENH, NGAY_VAO, NGAY_RA, LOAI_CP,
@@ -66,8 +65,7 @@ Dòng có giá trị trống sẽ gom vào file `KHONG_XAC_DINH.xlsx`.
 **Mục đích:** với dữ liệu XML1 có nhiều mã chuyên đề ở mỗi MA_CSKCB, `XML1_ID`
 là khóa của 1 hồ sơ (1 hồ sơ có thể có nhiều dòng chi phí), cột `T_BHTT` là số
 tiền dùng để trừ. Bạn cần biết: theo từng MA_CSKCB, từng Mã chuyên đề — trừ bao
-nhiêu **hồ sơ** và bao nhiêu **chi phí**, đồng thời có thể loại trừ một số dòng
-theo ý muốn (không tính vào kết quả trừ).
+nhiêu **hồ sơ** và bao nhiêu **chi phí**.
 
 Phần mềm tự quy đổi **Loại hồ sơ** (Ngoại trú/Nội trú) từ mã loại KCB:
 
@@ -80,10 +78,9 @@ Phần mềm tự quy đổi **Loại hồ sơ** (Ngoại trú/Nội trú) từ 
 
 1. Chọn file Excel → "Đọc cột của file" → chọn cột XML1_ID, MA_CSKCB, Mã
    chuyên đề, mã loại KCB (tuỳ chọn), T_BHTT.
-2. **Cột đánh dấu KHÔNG trừ** (tuỳ chọn): nếu file của bạn đã có sẵn 1 cột
-   dùng để đánh dấu các dòng không muốn trừ (ghi bất kỳ ký tự nào, để trống
-   các dòng còn lại), chọn đúng cột đó. Nếu để "-- Không dùng --", toàn bộ dữ
-   liệu sẽ được tính là bị trừ.
+2. **Cột đánh dấu KHÔNG trừ** (tuỳ chọn): ghi bất kỳ ký tự nào vào dòng không
+   muốn trừ trong file của bạn, để trống các dòng còn lại, rồi chọn đúng cột
+   đó. Nếu để "-- Không dùng --", toàn bộ dữ liệu sẽ được tính là bị trừ.
 3. Bấm **"Tính tổng hợp"** → xem tóm tắt kết quả ở khung log.
 4. Bấm **"Xuất kết quả tổng hợp ra Excel"** để lưu file 3 sheet:
    - `Tong_Hop_Chuyen_De`: `MA_CSKCB, MA_CHUYEN_DE, SO_HO_SO, TONG_CHI_PHI`.
@@ -119,122 +116,13 @@ Khoá kiểm tra trùng: **(XML1_ID, ID_CP, Mã chuyên đề)**.
 đã từng lưu → **"Lưu vào CSDL"** để ghi các dòng mới (dòng trùng khoá tự động
 bị bỏ qua, không tạo bản ghi trùng dù bấm lưu nhiều lần).
 
-## 6. Chức năng "Quản lý quy tắc giám định" (theo mã bệnh)
+## 6. Định nghĩa chuyên đề & Chạy theo kỳ (điều kiện SQL)
 
-**Mục đích:** định nghĩa quy tắc "Mã chi phí (MA_CP) chỉ được chỉ định khi chẩn
-đoán bệnh thuộc 1 danh sách mã bệnh (ICD) cho phép", theo từng Mã chuyên đề, áp
-dụng cho **nhiều chuyên đề khác nhau cùng lúc**. Quy tắc được dùng ở chức năng
-mục 7 để rà soát hồ sơ.
-
-**Ví dụ:** MA_CP `40.67` chỉ được dùng khi `MA_BENH` hoặc 1 trong các
-`MA_BENH_KHAC` (nhiều mã cách nhau bởi dấu `;`) thuộc nhóm **BONG** (Bỏng
-nắng): `L55, L55.0, L55.1, L55.2, L55.8`. Hồ sơ dùng MA_CP `40.67` nhưng không
-có mã bệnh nào trong nhóm này → bị coi là chỉ định sử dụng SAI quy định.
-
-### 1. Nạp danh mục quy tắc bằng file Excel
-
-Cách duy nhất để thêm quy tắc là **import file Excel** đúng cấu trúc cột quy
-định, mỗi dòng là 1 mã bệnh được phép cho 1 tổ hợp (Mã chuyên đề, MA_CP):
-
-| Cột | Bắt buộc | Ý nghĩa |
-|---|---|---|
-| `MA_CHUYEN_DE` | Có | Mã chuyên đề áp dụng quy tắc |
-| `TEN_CHUYEN_DE` | Không | Tên chuyên đề (để hiển thị) |
-| `MA_CP` | Có | Mã chi phí áp dụng quy tắc |
-| `TEN_CP` | Không | Tên chi phí (để hiển thị) |
-| `MA_BENH` | Có | 1 mã bệnh (ICD) được phép chỉ định |
-| `TEN_BENH` | Không | Tên bệnh (để hiển thị) |
-| `NHOM_BENH` | Không | Nhóm bệnh (ví dụ `BONG`) |
-
-Chọn file → "Đọc cột của file" → khai báo cột (kể cả khi tên cột trong file
-khác với tên chuẩn ở trên) → bấm **"Nạp / Cập nhật danh mục quy tắc vào
-CSDL"**. Quy tắc trùng khoá (Mã chuyên đề + MA_CP + MA_BENH) sẽ tự động **cập
-nhật** (ghi đè Tên bệnh/Nhóm bệnh mới) thay vì tạo bản ghi trùng — nạp lại
-file đã sửa để cập nhật quy tắc, không cần thao tác gì thêm. Có thể nạp nhiều
-file khác nhau cho **nhiều chuyên đề khác nhau**.
-
-### 2. Danh sách quy tắc hiện có (xem / xoá)
-
-Bảng hiển thị toàn bộ quy tắc đang có trong CSDL. Bấm "Tải lại danh sách" để
-làm mới; chọn 1 dòng rồi bấm **"Xoá dòng đã chọn"** để xoá hẳn quy tắc đó khỏi
-CSDL (có hỏi xác nhận). Muốn sửa nội dung 1 quy tắc, chỉnh lại trong file Excel
-rồi nạp lại (mục 1) — quy tắc trùng khoá sẽ tự cập nhật.
-
-## 7. Chức năng "Kiểm tra hồ sơ theo quy tắc" (theo mã bệnh)
-
-Dùng quy tắc đã định nghĩa ở mục 6 để rà soát hàng loạt hồ sơ, tự động tìm ra
-các dòng chỉ định SAI, kèm mã và nội dung lý do từ chối.
-
-### Nguồn dữ liệu: chỉ đọc từ CSDL SQLite
-
-Chức năng này **chỉ đọc dữ liệu từ 1 CSDL SQLite ngoài** (ví dụ
-`xml123.sqlite` — CSDL nguồn XML1 của riêng bạn, khác với `DB.sqlite` nội bộ
-của phần mềm), không hỗ trợ Excel. Chọn đường dẫn tới file CSDL → chọn bảng dữ
-liệu → "Đọc cột dữ liệu" → khai báo cột: `MA_CP`, `MA_BENH`, `MA_BENH_KHAC`
-(nhiều mã cách nhau bởi `;`), `MA_CHUYEN_DE` (tuỳ chọn). Tuỳ chọn thêm:
-
-- **Mã lý do từ chối (MA_LY_DO_TC)**: mặc định `CHOT_3`, có thể đổi.
-- **Nội dung lý do (LY_DO_TC)**: mẫu câu tự động điền, dùng được các chỗ giữ
-  chỗ `{MA_CP} {MA_BENH} {MA_BENH_KHAC} {NHOM_BENH} {DANH_SACH_MA_BENH}`.
-
-### Cách xác định dòng sai: dùng 1 câu lệnh SQL duy nhất
-
-Bấm **"Kiểm tra hồ sơ"**. Thay vì lặp qua từng dòng bằng Python, phần mềm
-**gắn (ATTACH DATABASE) CSDL quy tắc `DB.sqlite` vào cùng kết nối** với CSDL
-nguồn, rồi chạy 1 câu lệnh SQL duy nhất kiểu:
-
-```sql
-SELECT * FROM "<bảng_hồ_sơ>" s
-WHERE EXISTS (
-    SELECT 1 FROM rulesdb.QUY_TAC_BENH r WHERE r.MA_CP = s.MA_CP [AND r.MA_CHUYEN_DE = s.MA_CHUYEN_DE]
-)
-AND NOT EXISTS (
-    SELECT 1 FROM rulesdb.QUY_TAC_BENH r
-    WHERE r.MA_CP = s.MA_CP [AND r.MA_CHUYEN_DE = s.MA_CHUYEN_DE]
-      AND (r.MA_BENH = s.MA_BENH OR instr(';'||s.MA_BENH_KHAC||';', ';'||r.MA_BENH||';') > 0)
-)
-```
-
-Cách này lấy được đúng tập hồ sơ chỉ định sai ngay trong CSDL (nhanh với dữ
-liệu lớn, không cần tải hết dữ liệu vào bộ nhớ để lặp), phù hợp với yêu cầu
-"lấy dữ liệu theo nguyên tắc bằng SQL". Nếu có khai báo cột Mã chuyên đề, quy
-tắc được khớp đúng theo (Mã chuyên đề, MA_CP); nếu không khai báo, quy tắc
-được khớp theo MA_CP (gộp từ mọi chuyên đề có quy tắc cho MA_CP đó) — nhờ vậy
-hồ sơ thuộc **nhiều chuyên đề khác nhau** vẫn được xử lý đúng trong cùng 1 lần
-kiểm tra. Sau khi có tập hồ sơ sai (thường nhỏ hơn nhiều so với toàn bộ dữ
-liệu), phần mềm mới dùng Python để dựng nội dung câu `LY_DO_TC` cho từng dòng.
-
-> Phiên bản này bỏ tuỳ chọn "khớp theo tiền tố mã bệnh" (có ở bản trước) để
-> giữ câu lệnh SQL đơn giản, rõ ràng — chỉ khớp đúng chính xác mã bệnh đã khai
-> báo trong quy tắc.
-
-### Kết xuất — chuẩn hoá đúng cấu trúc cột đầu ra Excel
-
-Bấm **"Xuất dữ liệu SAI ra Excel"** để lưu toàn bộ dòng vi phạm. File xuất ra
-**luôn đủ 25 cột theo đúng thứ tự chuẩn** (giống hệt cấu trúc cột của chức
-năng "Tra cứu dữ liệu XML1" ở mục 2):
-
-```
-XML1_ID, MA_BN, MA_LK, HO_TEN, MA_THE, MA_BENH,
-NGAY_VAO, NGAY_RA, LOAI_CP, ID_CP, NGAY_Y_LENH,
-MA_CP, TEN_CP, SO_DANG_KY,
-SL_DC, DON_GIA_DC, TYLE_TT_DC, MUC_HUONG_DC,
-LY_DO_TC, MA_LY_DO_TC,
-MA_CSKCB, KY_QT, T_BHTT_DTL,
-MA_CHUYEN_DE, CONG_VAN
-```
-
-- Cột nào nguồn dữ liệu (Excel hoặc bảng CSDL ngoài) **có sẵn đúng tên** sẽ
-  được lấy giá trị tương ứng; cột nào nguồn không có sẽ để **trống**.
-- Riêng **`MA_LY_DO_TC`** và **`LY_DO_TC`** luôn được điền bằng giá trị vừa
-  tính từ quy tắc (không lấy từ nguồn, kể cả khi nguồn có sẵn 2 cột này).
-
-## 8. Chức năng "Định nghĩa chuyên đề (điều kiện SQL tuỳ ý)"
-
-Mục 6/7 chỉ xử lý được 1 dạng quy tắc: "MA_CP + danh sách mã bệnh cho phép".
-Nhiều chuyên đề giám định thực tế lại dựa trên **điều kiện hoàn toàn khác**
-(so sánh số lượng, đơn giá, danh sách mã chi phí...) — ví dụ chuyên đề "kế
-thừa thuốc vượt số lượng thực kê":
+**Đây là hệ quy tắc giám định DUY NHẤT của phần mềm** (thay cho hệ quy tắc
+theo danh sách mã bệnh ở các bản trước — đã gộp lại vì cả hai đều quy về việc
+đặt 1 điều kiện SQL dựa trên các cột dữ liệu, nên không cần 2 hệ song song).
+Phù hợp với mọi loại chuyên đề giám định, kể cả những chuyên đề không liên
+quan đến mã bệnh — ví dụ chuyên đề "kế thừa thuốc vượt số lượng thực kê":
 
 ```sql
 SO_LUONG_BV > 2 AND MA_CP in (
@@ -243,10 +131,12 @@ SO_LUONG_BV > 2 AND MA_CP in (
 )
 ```
 
-Chức năng này cho phép lưu lại **nguyên văn điều kiện SQL** đó thành 1 "chuyên
-đề" có mã riêng, để sau này chỉ cần chọn lại mà không phải sửa code mỗi lần.
+Gồm 2 trang: **định nghĩa** chuyên đề (lưu điều kiện SQL) và **chạy** chuyên đề
+đó theo từng kỳ.
 
-**Mỗi chuyên đề gồm:**
+### 6a. Trang "🧩 Định nghĩa chuyên đề (SQL)"
+
+Mỗi chuyên đề gồm:
 
 | Trường | Bắt buộc | Ý nghĩa |
 |---|---|---|
@@ -257,23 +147,21 @@ Chức năng này cho phép lưu lại **nguyên văn điều kiện SQL** đó 
 | `NOI_DUNG_CANH_BAO` | Không | Text sẽ tự điền vào cột `NOI_DUNG_CANH_BAO` của kết quả |
 | `DIEU_KIEN_SQL` | Có | Điều kiện SQL (phần sau `WHERE ... AND (`), **không cần viết điều kiện KY_QT** — phần mềm tự thêm khi chạy |
 
-**Cách nhập:**
-- **Thêm/cập nhật 1 chuyên đề**: điền form (có khung nhập nhiều dòng cho
-  `DIEU_KIEN_SQL`) → bấm "Lưu chuyên đề". Lưu trùng `MA_CHUYEN_DE` sẽ tự cập
-  nhật.
-- **Nạp hàng loạt bằng Excel** (tuỳ chọn): mỗi dòng 1 chuyên đề, đúng cột như
-  bảng trên → khai báo cột → "Nạp / Cập nhật từ Excel vào CSDL".
-- Bảng "Danh sách chuyên đề hiện có" cho xem/xoá.
+**Cách nhập:** điền form (có khung nhập nhiều dòng cho `DIEU_KIEN_SQL`) → bấm
+"Lưu chuyên đề". Lưu trùng `MA_CHUYEN_DE` sẽ tự động cập nhật (không tạo bản
+ghi trùng). Bảng "Danh sách chuyên đề hiện có" cho xem/xoá.
 
-> Lưu vào bảng `DINH_NGHIA_CHUYEN_DE` trong `DB.sqlite` (CSDL dùng chung, khác
-> bảng `QUY_TAC_BENH` ở mục 6 — 2 hệ thống quy tắc độc lập, dùng cho 2 dạng
-> chuyên đề khác nhau).
+> **Chỉ nhập tay từng chuyên đề** — không hỗ trợ nạp hàng loạt bằng Excel
+> (phiên bản trước có, nhưng do số dòng cấu hình mỗi chuyên đề thường không
+> nhiều nên đã bỏ để giao diện gọn hơn).
+>
+> Lưu vào bảng `DINH_NGHIA_CHUYEN_DE` trong `DB.sqlite` (CSDL dùng chung).
 
-## 9. Chức năng "Chạy chuyên đề theo kỳ"
+### 6b. Trang "▶️ Chạy chuyên đề theo kỳ"
 
-Chạy các chuyên đề đã định nghĩa ở mục 8 trên dữ liệu thật, **chỉ cần chọn
-chuyên đề và kỳ (KY_QT/tháng)** — đúng như yêu cầu, không cần viết lại script
-Python cho từng chuyên đề như trước.
+Chạy các chuyên đề đã định nghĩa ở trang 6a trên dữ liệu thật, **chỉ cần chọn
+chuyên đề và kỳ (KY_QT/tháng)** — không cần viết lại script Python cho từng
+chuyên đề.
 
 **Cách dùng:**
 
@@ -294,45 +182,64 @@ Python cho từng chuyên đề như trước.
    đó tự thêm cột `NOI_DUNG_CANH_BAO` theo nội dung đã khai báo cho chuyên đề
    đó.
 4. Bấm **"Xuất kết quả ra Excel"**: 1 file, **mỗi chuyên đề 1 sheet** (đặt tên
-   theo `TEN_SHEET`), đúng theo cách bạn đang tổ chức file (`sheets[sheet_name]
-   = DataOutput`).
+   theo `TEN_SHEET`), đúng theo cách tổ chức file kiểu `sheets[sheet_name] =
+   DataOutput` mà bạn đang dùng.
 
-## 10. Ghi chú kỹ thuật
+## 7. Chức năng "Ghép Folder Excel -> Nhiều Sheet"
+
+**Mục đích:** Khi có 1 thư mục chứa hàng chục / hàng trăm file Excel (`.xlsx`, `.xls`, `.xlsm`), chức năng này đọc tất cả file và gom thành **1 file Excel duy nhất**, trong đó mỗi file (hoặc mỗi sheet) trở thành 1 sheet riêng.
+
+### Cách dùng
+1. Bấm **"Chọn thư mục..."** → chọn thư mục chứa các file Excel cần ghép.
+2. Chọn **Chế độ lấy Sheet**:
+   - *Chỉ lấy Sheet đầu tiên của mỗi file (Tên Sheet = Tên file)*: Thích hợp khi mỗi file là 1 bảng dữ liệu độc lập.
+   - *Lấy tất cả Sheet của mỗi file (Tên Sheet = Tên file_Tên sheet)*: Thích hợp khi các file con chứa nhiều sheet nghiệp vụ khác nhau.
+3. Chọn đường dẫn file Excel kết quả (.xlsx).
+4. Bấm **"Bắt đầu ghép các file Excel"** → Hệ thống xử lý tự động chuẩn hóa tên sheet (bỏ ký tự cấm, cắt ngắn tối đa 31 ký tự, chống trùng tên) và xuất ra file.
+
+## 8. Chức năng "Ghép Nhiều Sheet -> 1 Sheet"
+
+**Mục đích:** Khi có 1 file Excel chứa nhiều Sheet có cùng hoặc khác cấu trúc cột, chức năng này cho phép gộp tất cả các dòng dữ liệu từ các sheet được chọn thành **1 sheet duy nhất** (tự động ghép các cột trùng tên và giữ nguyên các cột riêng).
+
+### Cách dùng
+1. Bấm **"Chọn file Excel..."** → Hệ thống tự động đọc và hiển thị toàn bộ danh sách sheet có trong file.
+2. Đánh dấu chọn / bỏ chọn các sheet cần ghép (có sẵn nút "Chọn tất cả" và "Bỏ chọn tất cả").
+3. Tùy chọn:
+   - **Thêm cột ghi rõ tên Sheet nguồn**: Thêm 1 cột (mặc định tên là `TEN_SHEET`) vào đầu mỗi dòng để biết dòng đó xuất phát từ sheet nào.
+   - **Bỏ qua các sheet không có dòng dữ liệu nào**: Tự động lọc bỏ các sheet trống.
+4. Bấm **"Bắt đầu ghép các sheet"** → Xem trước 500 dòng kết quả trực tiếp trên bảng xem trước.
+5. Bấm **"Xuất kết quả ra file Excel..."** để lưu file Excel tổng hợp hoàn chỉnh.
+
+## 9. Ghi chú kỹ thuật
 
 - Các thao tác đọc CSDL, tra cứu, tách file, tổng hợp, lưu/kiểm tra trùng và
-  kiểm tra quy tắc đều chạy trên luồng riêng (QThread) nên giao diện không bị
+  chạy chuyên đề đều chạy trên luồng riêng (QThread) nên giao diện không bị
   treo khi xử lý file lớn.
 - Đối chiếu XML1_ID/ID_CP dùng `pandas.merge` (join toàn bộ dữ liệu một lần)
   thay vì truy vấn từng dòng, xử lý nhanh hơn với file lớn.
-- **CSDL dùng chung `DB.sqlite`**: gồm 3 bảng — `HO_SO_DA_TRU` (mục 5),
-  `QUY_TAC_BENH` (mục 6, 7) và `DINH_NGHIA_CHUYEN_DE` (mục 8, 9). Đường dẫn
-  tính tự động và cố định qua hàm `get_app_dir()` (biến `DB_PATH` ở đầu file
-  `app_tra_cuu_xml1.py`): cùng thư mục với file `.py` khi chạy script, hoặc
-  cùng thư mục với file `.exe` khi đã đóng gói (kiểm tra qua `sys.frozen`).
-  Muốn đổi tên/vị trí file CSDL, chỉnh biến `DB_PATH` này — mọi chức năng
-  liên quan sẽ tự dùng theo.
-- CSDL nguồn dùng ở mục 2 (Tra cứu XML1), CSDL ngoài chọn ở mục 7 (Kiểm tra hồ
-  sơ theo quy tắc) và mục 9 (Chạy chuyên đề theo kỳ) là dữ liệu **của riêng
-  bạn**, do bạn tự chọn đường dẫn mỗi lần — khác với `DB.sqlite` (CSDL nội bộ,
-  cố định, do phần mềm quản lý).
-- Mục 7 dùng `sqlite3` `ATTACH DATABASE` để gộp 2 CSDL (nguồn + `DB.sqlite`)
-  vào cùng 1 kết nối, cho phép JOIN/EXISTS trực tiếp bằng SQL giữa 2 file
-  `.sqlite` khác nhau mà không cần nạp dữ liệu ra ngoài trước.
-- Mục 9 build câu lệnh SQL bằng cách nối trực tiếp `DIEU_KIEN_SQL` (do bạn tự
-  khai báo ở mục 8, được xem là đáng tin cậy vì do chính người quản trị nhập)
-  vào mệnh đề `WHERE`, riêng **giá trị kỳ (KY_QT) luôn được truyền qua tham số
-  `?`** (parameterized query) chứ không nối chuỗi trực tiếp, tránh lỗi cú
-  pháp/SQL injection từ giá trị chọn ở dropdown.
-- Kết quả xuất Excel của mục 7 (dữ liệu chỉ định sai) dùng chung danh sách cột
-  `OUTPUT_COLUMNS` với chức năng Tra cứu XML1 (mục 2), để đảm bảo cấu trúc file
-  đồng nhất trong toàn phần mềm. Mục 9 thì giữ nguyên cột theo `DANH_SACH_COT`
-  hoặc toàn bộ cột của bảng nguồn (không ép theo `OUTPUT_COLUMNS`), vì mỗi
-  chuyên đề SQL có thể cần bộ cột khác nhau.
+- **CSDL dùng chung `DB.sqlite`**: gồm 2 bảng — `HO_SO_DA_TRU` (mục 5) và
+  `DINH_NGHIA_CHUYEN_DE` (mục 6). Đường dẫn tính tự động và cố định qua hàm
+  `get_app_dir()` (biến `DB_PATH` ở đầu file `app_tra_cuu_xml1.py`): cùng thư
+  mục với file `.py` khi chạy script, hoặc cùng thư mục với file `.exe` khi đã
+  đóng gói (kiểm tra qua `sys.frozen`). Muốn đổi tên/vị trí file CSDL, chỉnh
+  biến `DB_PATH` này — mọi chức năng liên quan sẽ tự dùng theo.
+- CSDL nguồn dùng ở mục 2 (Tra cứu XML1) và CSDL ngoài chọn ở mục 6 (Chạy
+  chuyên đề theo kỳ) là dữ liệu **của riêng bạn**, do bạn tự chọn đường dẫn
+  mỗi lần — khác với `DB.sqlite` (CSDL nội bộ, cố định, do phần mềm quản lý).
+- Mục 6 build câu lệnh SQL bằng cách nối trực tiếp `DIEU_KIEN_SQL` (do bạn tự
+  khai báo, được xem là đáng tin cậy vì do chính người quản trị nhập) vào mệnh
+  đề `WHERE`, riêng **giá trị kỳ (KY_QT) luôn được truyền qua tham số `?`**
+  (parameterized query) chứ không nối chuỗi trực tiếp, tránh lỗi cú pháp/SQL
+  injection từ giá trị chọn ở dropdown.
+- Kết quả mục 6 giữ nguyên cột theo `DANH_SACH_COT` hoặc toàn bộ cột của bảng
+  nguồn (không ép theo khuôn cột cố định), vì mỗi chuyên đề SQL có thể cần bộ
+  cột khác nhau — khác với mục 2 (Tra cứu XML1) vốn luôn xuất đúng 25 cột
+  chuẩn `OUTPUT_COLUMNS`.
 - Muốn đổi danh sách cột đầu ra hoặc mapping mã loại KCB, chỉnh các biến
   `OUTPUT_COLUMNS`, `COLUMNS_NOT_IN_DB` và hàm `classify_loai_ho_so()` ở đầu
   file `app_tra_cuu_xml1.py`.
 
-## 11. Giao diện (Design System)
+## 10. Giao diện (Design System)
 
 Giao diện được viết theo skill **`pyqt6-ui-designer`** (Modern Enterprise
 Design System — xem `references/design_tokens.md`, `qss_patterns.md`,
@@ -350,12 +257,12 @@ Design System — xem `references/design_tokens.md`, `qss_patterns.md`,
 - **Khung ghi chú** (`#noteLabel`): nền xanh nhạt `#dae2ff`, chữ xám-xanh, bo
   góc `6px` (RADIUS_MD).
 - **Khung log** (`QTextEdit`): nền tối `#1d3054` (COLOR_INVERSE_SURFACE), chữ
-  sáng, font monospace — vẫn giữ phong cách "console" tương phản cao để dễ
-  đọc log xử lý dù tổng thể giao diện đã chuyển sang nền sáng.
+  sáng, font monospace. Riêng khung nhập liệu dài (`#sqlInputArea`, ví dụ ô
+  nhập Điều kiện SQL) được override lại thành nền sáng để phân biệt với khung
+  log.
 - **Typography**: tiêu đề dùng font "Hanken Grotesk" (có fallback Segoe UI),
   nội dung dùng "Inter" (có fallback Segoe UI) — nếu máy không cài 2 font này,
   Qt tự thay bằng font hệ thống tương đương, không lỗi.
 - Toàn bộ token màu/khoảng cách/bo góc được khai báo dưới dạng hằng số Python
   (`COLOR_*`, `SPACING_*`, `RADIUS_*`) ngay phía trên biến `APP_STYLE` trong
   `app_tra_cuu_xml1.py` — sửa 1 hằng số sẽ áp dụng lại cho toàn bộ giao diện.
-

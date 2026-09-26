@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 PHẦN MỀM NGHIỆP VỤ BHYT - GIÁM ĐỊNH XML1
-Giao diện menu hiện đại (sidebar) với 3 chức năng:
+Giao diện menu hiện đại (sidebar) gồm các chức năng:
     1. Tra cứu dữ liệu XML1 từ CSDL SQLite
     2. Tách file Excel theo MA_CSKCB
     3. Tổng hợp trừ chi phí theo MA_CSKCB & Mã chuyên đề
+    4. Lưu hồ sơ đã trừ vào CSDL SQLite & Kiểm tra trùng
+    5. Quản lý định nghĩa chuyên đề (SQL)
+    6. Chạy chuyên đề theo kỳ giám định
+    7. Ghép toàn bộ file Excel trong thư mục thành 1 file nhiều Sheet
+    8. Ghép nhiều Sheet trong 1 file Excel thành 1 Sheet duy nhất
 
 Yêu cầu thư viện:
     pip install PyQt6 pandas openpyxl
@@ -23,13 +28,13 @@ import unicodedata
 import pandas as pd
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt6.QtGui import QFont, QDesktopServices
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QFileDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QProgressBar, QMessageBox, QGroupBox,
-    QCheckBox, QFrame, QSizePolicy, QAbstractItemView
+    QCheckBox, QFrame, QAbstractItemView
 )
 
 NONE_OPTION = "-- Không dùng --"
@@ -105,6 +110,35 @@ def sanitize_filename(name: str) -> str:
         name = "KHONG_XAC_DINH"
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
     return name[:150]
+
+
+def sanitize_sheet_name(name: str, used_names: set | None = None) -> str:
+    """
+    Chuẩn hóa tên sheet hợp lệ cho Excel:
+    - Loại bỏ các ký tự cấm: \\ / ? * : [ ]
+    - Giới hạn tối đa 31 ký tự
+    - Đảm bảo không trùng với các tên sheet đã có trong tập used_names
+    """
+    if name is None:
+        name = "Sheet"
+    name = str(name).strip()
+    name = re.sub(r'[\\/?*:[\]]', '_', name).strip()
+    if not name or name.lower() == "nan":
+        name = "Sheet"
+    name = name[:31]
+
+    if used_names is not None:
+        base = name[:27]
+        final_name = name
+        counter = 1
+        while any(final_name.casefold() == u.casefold() for u in used_names):
+            suffix = f"_{counter}"
+            avail_len = max(1, 31 - len(suffix))
+            final_name = f"{base[:avail_len]}{suffix}"
+            counter += 1
+        used_names.add(final_name)
+        return final_name
+    return name
 
 
 def read_table_any(path: str) -> pd.DataFrame:
@@ -212,69 +246,6 @@ def classify_loai_ho_so(code) -> str:
     return "Khác/Không xác định"
 
 
-def normalize_code(v) -> str:
-    """Chuẩn hoá 1 mã (bệnh, chi phí, chuyên đề...): bỏ khoảng trắng thừa, viết hoa."""
-    if v is None:
-        return ""
-    s = str(v).strip().upper()
-    return "" if s == "" or s.lower() == "nan" else s
-
-
-def split_multi_codes(v) -> list:
-    """Tách chuỗi nhiều mã bệnh cách nhau bởi dấu ';' (hoặc xuống dòng) thành danh sách mã đã chuẩn hoá."""
-    if v is None:
-        return []
-    s = str(v).strip()
-    if s == "" or s.lower() == "nan":
-        return []
-    parts = re.split(r"[;\n]+", s)
-    return [normalize_code(p) for p in parts if normalize_code(p) != ""]
-
-
-DEFAULT_LY_DO_TC_TEMPLATE = (
-    "MA_CP {MA_CP} không phù hợp chẩn đoán (MA_BENH={MA_BENH}; "
-    "MA_BENH_KHAC={MA_BENH_KHAC}); chỉ áp dụng nhóm {NHOM_BENH}: {DANH_SACH_MA_BENH}"
-)
-
-
-def ensure_rules_table(conn):
-    """Đảm bảo bảng QUY_TAC_BENH tồn tại trong CSDL dùng chung (DB_PATH)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS QUY_TAC_BENH (
-            MA_CHUYEN_DE TEXT,
-            TEN_CHUYEN_DE TEXT,
-            MA_CP TEXT,
-            TEN_CP TEXT,
-            MA_BENH TEXT,
-            TEN_BENH TEXT,
-            NHOM_BENH TEXT,
-            UNIQUE(MA_CHUYEN_DE, MA_CP, MA_BENH)
-        )
-    """)
-    conn.commit()
-
-
-def upsert_rules(conn, rules_df: pd.DataFrame) -> int:
-    """
-    Ghi (thêm mới hoặc cập nhật nếu trùng khoá Mã chuyên đề+MA_CP+MA_BENH) danh
-    sách quy tắc vào bảng QUY_TAC_BENH. Trả về tổng số quy tắc trong CSDL sau khi ghi.
-    """
-    ensure_rules_table(conn)
-    cur = conn.cursor()
-    rows = list(rules_df[
-        ["MA_CHUYEN_DE", "TEN_CHUYEN_DE", "MA_CP", "TEN_CP", "MA_BENH", "TEN_BENH", "NHOM_BENH"]
-    ].itertuples(index=False, name=None))
-    cur.executemany(
-        "INSERT OR REPLACE INTO QUY_TAC_BENH "
-        "(MA_CHUYEN_DE, TEN_CHUYEN_DE, MA_CP, TEN_CP, MA_BENH, TEN_BENH, NHOM_BENH) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        rows
-    )
-    conn.commit()
-    cur.execute("SELECT COUNT(*) FROM QUY_TAC_BENH")
-    return cur.fetchone()[0]
-
-
 TOPIC_DEF_COLUMNS = [
     "MA_CHUYEN_DE", "TEN_CHUYEN_DE", "TEN_SHEET",
     "DANH_SACH_COT", "NOI_DUNG_CANH_BAO", "DIEU_KIEN_SQL",
@@ -320,7 +291,11 @@ def fill_table_widget(table: QTableWidget, df: pd.DataFrame, columns, max_rows=1
     for i, (_, row) in enumerate(df.head(max_rows).iterrows()):
         for j, col in enumerate(columns):
             val = row[col] if col in df.columns else ""
-            item = QTableWidgetItem("" if pd.isna(val) else str(val))
+            try:
+                is_na = bool(pd.isna(val))
+            except Exception:
+                is_na = False
+            item = QTableWidgetItem("" if is_na else str(val))
             table.setItem(i, j, item)
     table.resizeColumnsToContents()
 
@@ -479,7 +454,7 @@ class SplitWorker(QThread):
             self.log.emit(f"Tìm thấy {total} giá trị khác nhau của '{self.split_column}'.")
 
             for idx, (value, sub_df) in enumerate(groups, start=1):
-                fname = sanitize_filename(value) + ".xlsx"
+                fname = sanitize_filename(str(value)) + ".xlsx"
                 fpath = os.path.join(self.output_folder, fname)
                 sub_df.to_excel(fpath, index=False)
                 self.log.emit(f"  -> Đã tạo: {fname} ({len(sub_df)} dòng)")
@@ -526,10 +501,12 @@ class SummaryExcludeWorker(QThread):
             df = read_table_any(self.input_path)
             self.progress.emit(15)
 
-            for c, label in [(self.col_xml1id, "XML1_ID"),
-                              (self.col_ma_cskcb, "MA_CSKCB"),
-                              (self.col_chuyen_de, "Mã chuyên đề"),
-                              (self.col_tbhtt, "T_BHTT")]:
+            for c, label in [
+                (self.col_xml1id, "XML1_ID"),
+                (self.col_ma_cskcb, "MA_CSKCB"),
+                (self.col_chuyen_de, "Mã chuyên đề"),
+                (self.col_tbhtt, "T_BHTT"),
+            ]:
                 if c not in df.columns:
                     raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
 
@@ -558,8 +535,9 @@ class SummaryExcludeWorker(QThread):
                     + (", ".join(f"'{v}'" for v in sample_vals) if len(sample_vals) else "(không có giá trị nào khác rỗng)")
                 )
                 df["_KHONG_TRU"] = df[self.col_ghi_chu].apply(is_note_marked)
+                count_marked = int(sum(df["_KHONG_TRU"]))
                 self.log.emit(
-                    f"Số dòng có ghi chú (không trừ): {int(df['_KHONG_TRU'].sum())} / {len(df)}"
+                    f"Số dòng có ghi chú (không trừ): {count_marked} / {len(df)}"
                 )
             else:
                 df["_KHONG_TRU"] = False
@@ -567,7 +545,7 @@ class SummaryExcludeWorker(QThread):
                     "Không chọn cột Ghi chú không trừ -> mặc định TẤT CẢ các dòng đều được tính là bị trừ."
                 )
 
-            df["TRANG_THAI_TRU"] = df["_KHONG_TRU"].map({True: "Không trừ", False: "Trừ"})
+            df["TRANG_THAI_TRU"] = df["_KHONG_TRU"].map(lambda x: "Không trừ" if x else "Trừ")
 
             self.progress.emit(50)
             self.log.emit("Đang tổng hợp theo MA_CSKCB và Mã chuyên đề...")
@@ -587,12 +565,15 @@ class SummaryExcludeWorker(QThread):
                 .reset_index()
                 .rename(columns={self.col_ma_cskcb: "MA_CSKCB", self.col_chuyen_de: "MA_CHUYEN_DE"})
             )
-            summary_cd = summary_cd.sort_values(["MA_CSKCB", "MA_CHUYEN_DE"]).reset_index(drop=True)
+            summary_cd = summary_cd.sort_values(by=["MA_CSKCB", "MA_CHUYEN_DE"]).reset_index(drop=True)
 
             self.progress.emit(70)
             self.log.emit("Đang tổng hợp chi tiết theo Loại hồ sơ (Ngoại trú/Nội trú)...")
 
-            included["_LOAI_PIVOT"] = included["LOAI_HO_SO"].replace("", "Chưa xác định")
+            included["_LOAI_PIVOT"] = [
+                "Chưa xác định" if not str(v).strip() else str(v).strip()
+                for v in included["LOAI_HO_SO"]
+            ]
 
             long_cd_loai = (
                 included.groupby([self.col_ma_cskcb, self.col_chuyen_de, "_LOAI_PIVOT"])
@@ -638,16 +619,16 @@ class SummaryExcludeWorker(QThread):
                 summary_cd_loai["TONG_SO_HO_SO"] = summary_cd_loai[so_cols].sum(axis=1)
                 summary_cd_loai["TONG_CHI_PHI"] = summary_cd_loai[cp_cols].sum(axis=1)
 
-            summary_cd_loai = summary_cd_loai.sort_values(
-                ["MA_CSKCB", "MA_CHUYEN_DE"]
+            summary_cd_loai = pd.DataFrame(summary_cd_loai).sort_values(
+                by=["MA_CSKCB", "MA_CHUYEN_DE"]
             ).reset_index(drop=True)
 
             self.progress.emit(90)
 
             detail = df.drop(columns=["_KHONG_TRU"]).rename(columns={"_TBHTT_NUM": "T_BHTT_SO"})
 
-            total_ho_so = included[self.col_xml1id].nunique()
-            total_chi_phi = included["_TBHTT_NUM"].sum()
+            total_ho_so = len(set(included[self.col_xml1id])) if not included.empty else 0
+            total_chi_phi = sum(float(x) for x in included["_TBHTT_NUM"]) if not included.empty else 0.0
             self.log.emit(
                 f"Hoàn tất. Tổng số hồ sơ bị trừ: {total_ho_so} | "
                 f"Tổng chi phí bị trừ: {format_money(total_chi_phi)}"
@@ -712,9 +693,11 @@ class DeductedDbWorker(QThread):
         df = read_table_any(self.input_path)
         self.progress.emit(10)
 
-        for c, label in [(self.col_ma_cskcb, "MA_CSKCB"),
-                          (self.col_xml1, "XML1_ID"),
-                          (self.col_chuyen_de, "Mã chuyên đề")]:
+        for c, label in [
+            (self.col_ma_cskcb, "MA_CSKCB"),
+            (self.col_xml1, "XML1_ID"),
+            (self.col_chuyen_de, "Mã chuyên đề"),
+        ]:
             if c not in df.columns:
                 raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
 
@@ -746,7 +729,7 @@ class DeductedDbWorker(QThread):
         found_extra, missing_extra = [], []
         for c in DEDUCTED_EXTRA_COLUMNS:
             if c in df.columns:
-                data[c] = df[c].fillna("").astype(str).str.strip()
+                data[c] = pd.Series(df[c]).fillna("").astype(str).str.strip()
                 found_extra.append(c)
             else:
                 data[c] = pd.Series([""] * len(df), index=df.index)
@@ -802,7 +785,7 @@ class DeductedDbWorker(QThread):
 
                 else:  # save
                     before_dedup = len(records)
-                    records = records.drop_duplicates(
+                    records = pd.DataFrame(records).drop_duplicates(
                         subset=["XML1_ID", "ID_CP", "MA_CHUYEN_DE"]
                     )
                     intra_dup = before_dedup - len(records)
@@ -1448,7 +1431,7 @@ class ExcludeSummaryPage(QWidget):
         QMessageBox.critical(self, "Lỗi", msg)
 
     def export_summary(self):
-        if self.summary_cd_df is None:
+        if self.summary_cd_df is None or self.summary_cd_loai_df is None or self.detail_df is None:
             QMessageBox.warning(self, "Không có dữ liệu", "Chưa có kết quả để xuất.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -1464,357 +1447,6 @@ class ExcludeSummaryPage(QWidget):
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
-
-
-# ============================================================
-# WORKER: NẠP/CẬP NHẬT DANH MỤC QUY TẮC GIÁM ĐỊNH THEO CHUYÊN ĐỀ
-# ============================================================
-
-class RuleLoadWorker(QThread):
-    log = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    finished_ok = pyqtSignal(int, int)  # số dòng nạp từ file, tổng số quy tắc trong CSDL sau khi nạp
-    failed = pyqtSignal(str)
-
-    def __init__(self, input_path, col_ma_cd, col_ten_cd, col_ma_cp, col_ten_cp,
-                 col_ma_benh, col_ten_benh, col_nhom_benh):
-        super().__init__()
-        self.input_path = input_path
-        self.col_ma_cd = col_ma_cd
-        self.col_ten_cd = col_ten_cd
-        self.col_ma_cp = col_ma_cp
-        self.col_ten_cp = col_ten_cp
-        self.col_ma_benh = col_ma_benh
-        self.col_ten_benh = col_ten_benh
-        self.col_nhom_benh = col_nhom_benh
-
-    def run(self):
-        try:
-            self.log.emit("Đang đọc file Excel danh mục quy tắc...")
-            df = read_table_any(self.input_path)
-            self.progress.emit(15)
-
-            for c, label in [(self.col_ma_cd, "Mã chuyên đề"),
-                              (self.col_ma_cp, "MA_CP"),
-                              (self.col_ma_benh, "MA_BENH")]:
-                if c not in df.columns:
-                    raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
-
-            def get_col(colname):
-                if colname and colname != NONE_OPTION and colname in df.columns:
-                    return df[colname].fillna("").astype(str).str.strip()
-                return pd.Series([""] * len(df), index=df.index)
-
-            rules = pd.DataFrame({
-                "MA_CHUYEN_DE": get_col(self.col_ma_cd).str.upper(),
-                "TEN_CHUYEN_DE": get_col(self.col_ten_cd),
-                "MA_CP": get_col(self.col_ma_cp).str.upper(),
-                "TEN_CP": get_col(self.col_ten_cp),
-                "MA_BENH": get_col(self.col_ma_benh).str.upper(),
-                "TEN_BENH": get_col(self.col_ten_benh),
-                "NHOM_BENH": get_col(self.col_nhom_benh).str.upper(),
-            })
-            before_n = len(rules)
-            rules = rules[
-                (rules["MA_CHUYEN_DE"] != "") & (rules["MA_CP"] != "") & (rules["MA_BENH"] != "")
-            ]
-            rules = rules.drop_duplicates(subset=["MA_CHUYEN_DE", "MA_CP", "MA_BENH"])
-            if len(rules) < before_n:
-                self.log.emit(
-                    f"Đã bỏ qua {before_n - len(rules)} dòng thiếu Mã chuyên đề/MA_CP/MA_BENH "
-                    "hoặc trùng lặp ngay trong file."
-                )
-            self.progress.emit(35)
-
-            if rules.empty:
-                raise ValueError("Không có dòng quy tắc hợp lệ nào để nạp.")
-
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                self.progress.emit(55)
-                self.log.emit(f"Đang nạp/cập nhật {len(rules)} dòng quy tắc vào CSDL...")
-                total_after = upsert_rules(conn, rules)
-                self.progress.emit(90)
-            finally:
-                conn.close()
-
-            self.progress.emit(100)
-            self.log.emit(
-                f"Hoàn tất. Đã nạp {len(rules)} dòng quy tắc từ file. "
-                f"Tổng số quy tắc hiện có trong CSDL: {total_after}."
-            )
-            self.finished_ok.emit(len(rules), total_after)
-
-        except Exception as e:
-            self.log.emit("LỖI: " + str(e))
-            self.log.emit(traceback.format_exc())
-            self.failed.emit(str(e))
-
-
-# ============================================================
-# WORKER: KIỂM TRA HỒ SƠ THEO QUY TẮC GIÁM ĐỊNH CHUYÊN ĐỀ
-# ============================================================
-
-class RuleCheckWorker(QThread):
-    log = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    # violations_df, tổng số dòng, số dòng có quy tắc áp dụng, số dòng sai
-    finished_ok = pyqtSignal(object, int, int, int)
-    failed = pyqtSignal(str)
-
-    def __init__(self, src_db_path, src_table_name,
-                 col_ma_cp, col_ma_benh, col_ma_benh_khac,
-                 col_ma_chuyen_de, ma_ly_do_tc, ly_do_tc_template):
-        super().__init__()
-        self.src_db_path = src_db_path
-        self.src_table_name = src_table_name
-        self.col_ma_cp = col_ma_cp
-        self.col_ma_benh = col_ma_benh
-        self.col_ma_benh_khac = col_ma_benh_khac
-        self.col_ma_chuyen_de = col_ma_chuyen_de
-        self.ma_ly_do_tc = ma_ly_do_tc
-        self.ly_do_tc_template = ly_do_tc_template
-
-    def run(self):
-        try:
-            self.log.emit(f"Đang kết nối CSDL nguồn '{self.src_table_name}'...")
-            conn = sqlite3.connect(self.src_db_path)
-
-            cur = conn.execute(f'PRAGMA table_info("{self.src_table_name}")')
-            src_cols = [row[1] for row in cur.fetchall()]
-            if self.col_ma_cp not in src_cols:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_cp}' (dùng cho MA_CP) trong bảng.")
-            use_ma_benh = bool(self.col_ma_benh) and self.col_ma_benh != NONE_OPTION
-            use_ma_benh_khac = bool(self.col_ma_benh_khac) and self.col_ma_benh_khac != NONE_OPTION
-            if not use_ma_benh and not use_ma_benh_khac:
-                raise ValueError("Cần chọn ít nhất 1 trong 2 cột MA_BENH hoặc MA_BENH_KHAC để kiểm tra.")
-            if use_ma_benh and self.col_ma_benh not in src_cols:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_benh}' trong bảng.")
-            if use_ma_benh_khac and self.col_ma_benh_khac not in src_cols:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_benh_khac}' trong bảng.")
-            use_ma_cd = bool(self.col_ma_chuyen_de) and self.col_ma_chuyen_de != NONE_OPTION
-            if use_ma_cd and self.col_ma_chuyen_de not in src_cols:
-                raise ValueError(f"Không tìm thấy cột '{self.col_ma_chuyen_de}' trong bảng.")
-
-            self.progress.emit(10)
-
-            self.log.emit("Đang gắn CSDL quy tắc (ATTACH DATABASE) để đối chiếu bằng SQL...")
-            safe_rules_path = DB_PATH.replace("'", "''")
-            conn.execute(f"ATTACH DATABASE '{safe_rules_path}' AS rulesdb")
-            try:
-                conn.execute("SELECT COUNT(*) FROM rulesdb.QUY_TAC_BENH")
-            except sqlite3.OperationalError:
-                raise ValueError(
-                    "Chưa có quy tắc nào trong danh mục. Vui lòng nạp danh mục quy tắc ở "
-                    "trang 'Quản lý quy tắc giám định' trước khi kiểm tra."
-                )
-            self.progress.emit(20)
-
-            # --- Xây dựng điều kiện SQL: dòng có quy tắc áp dụng & dòng SAI quy tắc ---
-            match_parts = []
-            if use_ma_benh:
-                match_parts.append(f'r.MA_BENH = s."{self.col_ma_benh}"')
-            if use_ma_benh_khac:
-                match_parts.append(
-                    f'instr(";" || COALESCE(s."{self.col_ma_benh_khac}", "") || ";", '
-                    f'";" || r.MA_BENH || ";") > 0'
-                )
-            match_sql = " OR ".join(match_parts)
-
-            if use_ma_cd:
-                scope_sql = f'r.MA_CP = s."{self.col_ma_cp}" AND r.MA_CHUYEN_DE = s."{self.col_ma_chuyen_de}"'
-            else:
-                scope_sql = f'r.MA_CP = s."{self.col_ma_cp}"'
-
-            applicable_sql = f'EXISTS (SELECT 1 FROM rulesdb.QUY_TAC_BENH r WHERE {scope_sql})'
-            violation_sql = (
-                f'NOT EXISTS (SELECT 1 FROM rulesdb.QUY_TAC_BENH r '
-                f'WHERE {scope_sql} AND ({match_sql}))'
-            )
-
-            self.log.emit("Đang truy vấn SQL để lấy các dòng chỉ định SAI quy tắc...")
-            total = pd.read_sql_query(
-                f'SELECT COUNT(*) c FROM "{self.src_table_name}"', conn
-            ).iloc[0, 0]
-            so_co_quy_tac = pd.read_sql_query(
-                f'SELECT COUNT(*) c FROM "{self.src_table_name}" s WHERE {applicable_sql}', conn
-            ).iloc[0, 0]
-            self.progress.emit(40)
-
-            violations_raw = pd.read_sql_query(
-                f'SELECT * FROM "{self.src_table_name}" s '
-                f'WHERE {applicable_sql} AND {violation_sql}',
-                conn
-            )
-            self.progress.emit(70)
-            conn.close()
-
-            self.log.emit(
-                f"SQL trả về {len(violations_raw)} dòng SAI quy tắc (trên {so_co_quy_tac} dòng "
-                f"có quy tắc áp dụng / {total} dòng tổng)."
-            )
-
-            # --- Nạp chi tiết quy tắc (chỉ để dựng nội dung lý do LY_DO_TC) ---
-            rconn = sqlite3.connect(DB_PATH)
-            try:
-                ensure_rules_table(rconn)
-                rules_df = pd.read_sql_query("SELECT * FROM QUY_TAC_BENH", rconn)
-            finally:
-                rconn.close()
-
-            rules_by_cd_cp = {}
-            rules_by_cp = {}
-            for _, r in rules_df.iterrows():
-                cd, cp, benh, nhom = r["MA_CHUYEN_DE"], r["MA_CP"], r["MA_BENH"], r["NHOM_BENH"]
-                entry_cd = rules_by_cd_cp.setdefault((cd, cp), {"codes": set(), "nhom": set()})
-                entry_cd["codes"].add(benh)
-                if nhom:
-                    entry_cd["nhom"].add(nhom)
-                entry_cp = rules_by_cp.setdefault(cp, {"codes": set(), "nhom": set()})
-                entry_cp["codes"].add(benh)
-                if nhom:
-                    entry_cp["nhom"].add(nhom)
-
-            violations = []
-            for row in violations_raw.to_dict("records"):
-                ma_cp = normalize_code(row.get(self.col_ma_cp, ""))
-                ma_chuyen_de = normalize_code(row.get(self.col_ma_chuyen_de, "")) if use_ma_cd else ""
-                rule_entry = (
-                    rules_by_cd_cp.get((ma_chuyen_de, ma_cp)) if use_ma_cd
-                    else rules_by_cp.get(ma_cp)
-                )
-                if rule_entry is None:
-                    continue
-
-                ma_benh = normalize_code(row.get(self.col_ma_benh, "")) if use_ma_benh else ""
-                ma_benh_khac_list = (
-                    split_multi_codes(row.get(self.col_ma_benh_khac, "")) if use_ma_benh_khac else []
-                )
-                nhom_txt = ", ".join(sorted(rule_entry["nhom"])) if rule_entry["nhom"] else "(không xác định)"
-                codes_txt = ", ".join(sorted(rule_entry["codes"]))
-                try:
-                    ly_do = self.ly_do_tc_template.format(
-                        MA_CP=ma_cp,
-                        MA_BENH=ma_benh or "(trống)",
-                        MA_BENH_KHAC=(";".join(ma_benh_khac_list) or "(trống)"),
-                        NHOM_BENH=nhom_txt,
-                        DANH_SACH_MA_BENH=codes_txt,
-                    )
-                except (KeyError, IndexError):
-                    ly_do = DEFAULT_LY_DO_TC_TEMPLATE.format(
-                        MA_CP=ma_cp,
-                        MA_BENH=ma_benh or "(trống)",
-                        MA_BENH_KHAC=(";".join(ma_benh_khac_list) or "(trống)"),
-                        NHOM_BENH=nhom_txt,
-                        DANH_SACH_MA_BENH=codes_txt,
-                    )
-                # Chuẩn hoá dòng xuất ra theo đúng OUTPUT_COLUMNS (giống cấu trúc cột của
-                # chức năng Tra cứu XML1): lấy giá trị từ nguồn nếu có cột trùng tên, cột
-                # nào nguồn không có sẽ để trống; riêng MA_LY_DO_TC/LY_DO_TC luôn lấy giá
-                # trị vừa tính từ quy tắc.
-                out_row = {}
-                for col in OUTPUT_COLUMNS:
-                    if col in ("MA_LY_DO_TC", "LY_DO_TC"):
-                        continue
-                    v = row.get(col, "")
-                    out_row[col] = "" if pd.isna(v) else v
-                out_row["MA_LY_DO_TC"] = self.ma_ly_do_tc
-                out_row["LY_DO_TC"] = ly_do
-                violations.append(out_row)
-
-            violations_df = pd.DataFrame(violations)
-            if not violations_df.empty:
-                violations_df = violations_df[OUTPUT_COLUMNS]
-            self.progress.emit(100)
-            self.log.emit(
-                f"Hoàn tất. Đã kiểm tra {total} dòng, {so_co_quy_tac} dòng có quy tắc áp dụng, "
-                f"phát hiện {len(violations_df)} dòng chỉ định SAI quy định."
-            )
-            self.finished_ok.emit(violations_df, int(total), int(so_co_quy_tac), len(violations_df))
-
-        except Exception as e:
-            self.log.emit("LỖI: " + str(e))
-            self.log.emit(traceback.format_exc())
-            self.failed.emit(str(e))
-
-
-# ============================================================
-# WORKER: NẠP ĐỊNH NGHĨA CHUYÊN ĐỀ (DẠNG ĐIỀU KIỆN SQL) TỪ EXCEL
-# ============================================================
-
-class TopicDefLoadWorker(QThread):
-    log = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    finished_ok = pyqtSignal(int, int)  # số dòng nạp, tổng số chuyên đề trong CSDL
-    failed = pyqtSignal(str)
-
-    def __init__(self, input_path, col_ma_cd, col_ten_cd, col_ten_sheet,
-                 col_danh_sach_cot, col_noi_dung_canh_bao, col_dieu_kien_sql):
-        super().__init__()
-        self.input_path = input_path
-        self.col_ma_cd = col_ma_cd
-        self.col_ten_cd = col_ten_cd
-        self.col_ten_sheet = col_ten_sheet
-        self.col_danh_sach_cot = col_danh_sach_cot
-        self.col_noi_dung_canh_bao = col_noi_dung_canh_bao
-        self.col_dieu_kien_sql = col_dieu_kien_sql
-
-    def run(self):
-        try:
-            self.log.emit("Đang đọc file Excel định nghĩa chuyên đề...")
-            df = read_table_any(self.input_path)
-            self.progress.emit(20)
-
-            for c, label in [(self.col_ma_cd, "Mã chuyên đề"), (self.col_dieu_kien_sql, "Điều kiện SQL")]:
-                if c not in df.columns:
-                    raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
-
-            def get_col(colname):
-                if colname and colname != NONE_OPTION and colname in df.columns:
-                    return df[colname].fillna("").astype(str).str.strip()
-                return pd.Series([""] * len(df), index=df.index)
-
-            defs = pd.DataFrame({
-                "MA_CHUYEN_DE": get_col(self.col_ma_cd).str.upper(),
-                "TEN_CHUYEN_DE": get_col(self.col_ten_cd),
-                "TEN_SHEET": get_col(self.col_ten_sheet),
-                "DANH_SACH_COT": get_col(self.col_danh_sach_cot),
-                "NOI_DUNG_CANH_BAO": get_col(self.col_noi_dung_canh_bao),
-                "DIEU_KIEN_SQL": get_col(self.col_dieu_kien_sql),
-            })
-            before_n = len(defs)
-            defs = defs[(defs["MA_CHUYEN_DE"] != "") & (defs["DIEU_KIEN_SQL"] != "")]
-            defs = defs.drop_duplicates(subset=["MA_CHUYEN_DE"], keep="last")
-            if len(defs) < before_n:
-                self.log.emit(
-                    f"Đã bỏ qua {before_n - len(defs)} dòng thiếu Mã chuyên đề/Điều kiện SQL "
-                    "hoặc trùng lặp ngay trong file."
-                )
-            if defs.empty:
-                raise ValueError("Không có dòng định nghĩa chuyên đề hợp lệ nào để nạp.")
-            self.progress.emit(50)
-
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                ensure_topic_defs_table(conn)
-                for _, r in defs.iterrows():
-                    upsert_topic_def(conn, r.to_dict())
-                cur = conn.execute("SELECT COUNT(*) FROM DINH_NGHIA_CHUYEN_DE")
-                total_after = cur.fetchone()[0]
-            finally:
-                conn.close()
-
-            self.progress.emit(100)
-            self.log.emit(
-                f"Hoàn tất. Đã nạp {len(defs)} chuyên đề từ file. "
-                f"Tổng số chuyên đề hiện có trong CSDL: {total_after}."
-            )
-            self.finished_ok.emit(len(defs), total_after)
-
-        except Exception as e:
-            self.log.emit("LỖI: " + str(e))
-            self.log.emit(traceback.format_exc())
-            self.failed.emit(str(e))
 
 
 # ============================================================
@@ -1858,7 +1490,7 @@ class TopicRunWorker(QThread):
                 )
                 self.log.emit(f"[{ma_cd}] Đang chạy: {sql}  (kỳ = {self.ky_qt_value})")
                 try:
-                    df = pd.read_sql_query(sql, conn, params=(self.ky_qt_value,))
+                    df = pd.read_sql_query(sql, conn, params=[self.ky_qt_value])
                 except Exception as e:
                     raise ValueError(f"Lỗi khi chạy chuyên đề '{ma_cd}': {e}") from e
 
@@ -1896,12 +1528,6 @@ class SaveDeductedPage(QWidget):
 
         layout.addWidget(page_title("Lưu hồ sơ đã trừ vào CSDL & Kiểm tra trùng"))
         note = QLabel(
-            "Tải file Excel chứa danh sách hồ sơ/dòng chi phí ĐÃ TRỪ (ví dụ sheet "
-            "Chi_Tiet xuất ra từ chức năng Tổng hợp trừ chi phí, hoặc file bạn tự "
-            "chuẩn bị) để lưu vào 1 CSDL SQLite dùng chung, phục vụ đối chiếu về sau. "
-            "Khi có đợt xử lý mới (kể cả với mã chuyên đề mới), dùng chức năng này để "
-            "kiểm tra xem các hồ sơ có bị TRỪ TRÙNG với các lần trước hay không trước "
-            "khi lưu chính thức.\n\n"
             "Ngoài 5 cột khai báo bên dưới, phần mềm tự động lấy thêm (nếu file có sẵn "
             "đúng tên cột, không cần chọn thủ công): MA_BN, HO_TEN, MA_THE, MA_BENH, "
             "MA_BENH_KHAC, NGAY_VAO, NGAY_RA, LOAI_CP, MA_CP, TEN_CP, SO_DANG_KY, SL_DC, "
@@ -2158,518 +1784,12 @@ class SaveDeductedPage(QWidget):
 
 
 # ============================================================
-# TRANG 5: QUY TẮC GIÁM ĐỊNH THEO CHUYÊN ĐỀ
-# ============================================================
-
-# ============================================================
-# TRANG 5: QUẢN LÝ QUY TẮC GIÁM ĐỊNH THEO CHUYÊN ĐỀ
-# ============================================================
-
-class RuleManagePage(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.rule_file_columns = []
-        self.rules_table_df = None
-        self._build_ui()
-        self.refresh_rules_table()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
-
-        layout.addWidget(page_title("Quản lý quy tắc giám định theo chuyên đề"))
-        note = QLabel(
-            "Định nghĩa quy tắc: với mỗi Mã chuyên đề + Mã chi phí (MA_CP), khai báo danh "
-            "sách các Mã bệnh (MA_BENH, theo ICD) được phép chỉ định. Nạp danh mục bằng "
-            "file Excel đúng cấu trúc cột quy định, sau đó có thể xem/xoá từng quy tắc ở "
-            "bảng bên dưới. Quy tắc được dùng ở chức năng '🚨 Kiểm tra hồ sơ theo quy tắc'."
-        )
-        note.setWordWrap(True)
-        note.setObjectName("noteLabel")
-        layout.addWidget(note)
-
-        # --- Nhóm 1: Nạp danh mục quy tắc bằng Excel ---
-        rule_group = QGroupBox("1. Nạp danh mục quy tắc bằng file Excel")
-        rule_form = QFormLayout()
-
-        self.rule_path_edit = QLineEdit()
-        browse_rule_btn = QPushButton("Chọn file Excel danh mục...")
-        browse_rule_btn.clicked.connect(self.browse_rule_file)
-        row1 = QHBoxLayout()
-        row1.addWidget(self.rule_path_edit)
-        row1.addWidget(browse_rule_btn)
-        rule_form.addRow("File danh mục quy tắc:", row1)
-
-        self.read_rule_cols_btn = QPushButton("Đọc cột của file")
-        self.read_rule_cols_btn.clicked.connect(self.load_rule_columns)
-        rule_form.addRow("", self.read_rule_cols_btn)
-
-        self.rule_col_ma_cd_combo = QComboBox()
-        rule_form.addRow("Cột Mã chuyên đề:", self.rule_col_ma_cd_combo)
-        self.rule_col_ten_cd_combo = QComboBox()
-        rule_form.addRow("Cột Tên chuyên đề (nếu có):", self.rule_col_ten_cd_combo)
-        self.rule_col_ma_cp_combo = QComboBox()
-        rule_form.addRow("Cột MA_CP:", self.rule_col_ma_cp_combo)
-        self.rule_col_ten_cp_combo = QComboBox()
-        rule_form.addRow("Cột Tên chi phí (nếu có):", self.rule_col_ten_cp_combo)
-        self.rule_col_ma_benh_combo = QComboBox()
-        rule_form.addRow("Cột Mã bệnh (ICD) cho phép:", self.rule_col_ma_benh_combo)
-        self.rule_col_ten_benh_combo = QComboBox()
-        rule_form.addRow("Cột Tên bệnh (nếu có):", self.rule_col_ten_benh_combo)
-        self.rule_col_nhom_benh_combo = QComboBox()
-        rule_form.addRow("Cột Nhóm bệnh (nếu có, vd BONG):", self.rule_col_nhom_benh_combo)
-
-        rule_group.setLayout(rule_form)
-        layout.addWidget(rule_group)
-
-        self.load_rules_btn = QPushButton("Nạp / Cập nhật danh mục quy tắc vào CSDL")
-        self.load_rules_btn.setObjectName("primaryBtn")
-        self.load_rules_btn.clicked.connect(self.run_load_rules)
-        layout.addWidget(self.load_rules_btn)
-
-        rules_db_info = QLabel(
-            f"📁 Quy tắc được lưu vào bảng QUY_TAC_BENH trong CSDL DÙNG CHUNG của toàn "
-            f"phần mềm (gắn cố định kèm phần mềm): {DB_PATH}\n"
-            "Nạp lại quy tắc trùng khoá (Mã chuyên đề + MA_CP + MA_BENH) sẽ tự động CẬP "
-            "NHẬT thay vì tạo bản ghi trùng — nạp lại file đã sửa để cập nhật quy tắc."
-        )
-        rules_db_info.setWordWrap(True)
-        rules_db_info.setObjectName("noteLabel")
-        layout.addWidget(rules_db_info)
-
-        # --- Nhóm 2: Danh sách quy tắc hiện có (xem / xoá) ---
-        list_group = QGroupBox("2. Danh sách quy tắc hiện có")
-        list_layout = QVBoxLayout()
-
-        list_btn_row = QHBoxLayout()
-        self.refresh_rules_btn = QPushButton("Tải lại danh sách")
-        self.refresh_rules_btn.clicked.connect(self.refresh_rules_table)
-        self.delete_selected_btn = QPushButton("Xoá dòng đã chọn")
-        self.delete_selected_btn.clicked.connect(self.delete_selected_rule)
-        list_btn_row.addWidget(self.refresh_rules_btn)
-        list_btn_row.addWidget(self.delete_selected_btn)
-        list_layout.addLayout(list_btn_row)
-
-        self.rules_table = QTableWidget()
-        self.rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        list_layout.addWidget(self.rules_table)
-
-        list_group.setLayout(list_layout)
-        layout.addWidget(list_group, stretch=2)
-
-        self.progress = QProgressBar()
-        layout.addWidget(self.progress)
-
-        layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(140)
-        layout.addWidget(self.log_box, stretch=1)
-
-    def append_log(self, text):
-        self.log_box.append(text)
-
-    # --- Nhóm 1: nạp quy tắc bằng Excel ---
-
-    def browse_rule_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn file Excel danh mục quy tắc", "",
-            "Excel/CSV (*.xlsx *.xls *.csv);;Tất cả file (*.*)"
-        )
-        if not path:
-            return
-        self.rule_path_edit.setText(path)
-        self.load_rule_columns()
-
-    def load_rule_columns(self):
-        path = self.rule_path_edit.text().strip()
-        if not path:
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file danh mục quy tắc trước.")
-            return
-        try:
-            df = read_table_any(path)
-            self.rule_file_columns = list(df.columns)
-
-            def fill_combo(combo, guesses, allow_none=False):
-                combo.clear()
-                if allow_none:
-                    combo.addItem(NONE_OPTION)
-                combo.addItems(self.rule_file_columns)
-                for g in guesses:
-                    if g in self.rule_file_columns:
-                        combo.setCurrentText(g)
-                        return g
-                return None
-
-            fill_combo(self.rule_col_ma_cd_combo, ["MA_CHUYEN_DE", "MA_CD"])
-            fill_combo(self.rule_col_ten_cd_combo, ["TEN_CHUYEN_DE"], allow_none=True)
-            fill_combo(self.rule_col_ma_cp_combo, ["MA_CP"])
-            fill_combo(self.rule_col_ten_cp_combo, ["TEN_CP"], allow_none=True)
-            fill_combo(self.rule_col_ma_benh_combo, ["MA_BENH"])
-            fill_combo(self.rule_col_ten_benh_combo, ["TEN_BENH"], allow_none=True)
-            fill_combo(self.rule_col_nhom_benh_combo, ["NHOM_BENH"], allow_none=True)
-
-            self.append_log(f"Đã đọc {len(self.rule_file_columns)} cột, {len(df)} dòng từ file danh mục.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được file:\n{e}")
-
-    def run_load_rules(self):
-        path = self.rule_path_edit.text().strip()
-        if not path or not os.path.isfile(path):
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file danh mục quy tắc hợp lệ.")
-            return
-        col_ma_cd = self.rule_col_ma_cd_combo.currentText().strip()
-        col_ma_cp = self.rule_col_ma_cp_combo.currentText().strip()
-        col_ma_benh = self.rule_col_ma_benh_combo.currentText().strip()
-        if not col_ma_cd or not col_ma_cp or not col_ma_benh:
-            QMessageBox.warning(
-                self, "Thiếu thông tin",
-                "Vui lòng chọn đủ cột Mã chuyên đề, MA_CP và Mã bệnh cho phép."
-            )
-            return
-
-        self.load_rules_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.log_box.clear()
-
-        self.rule_worker = RuleLoadWorker(
-            path, col_ma_cd,
-            self.rule_col_ten_cd_combo.currentText().strip(),
-            col_ma_cp,
-            self.rule_col_ten_cp_combo.currentText().strip(),
-            col_ma_benh,
-            self.rule_col_ten_benh_combo.currentText().strip(),
-            self.rule_col_nhom_benh_combo.currentText().strip(),
-        )
-        self.rule_worker.log.connect(self.append_log)
-        self.rule_worker.progress.connect(self.progress.setValue)
-        self.rule_worker.finished_ok.connect(self.on_rules_loaded)
-        self.rule_worker.failed.connect(self.on_rule_failed)
-        self.rule_worker.start()
-
-    def on_rules_loaded(self, so_dong, tong_so):
-        self.load_rules_btn.setEnabled(True)
-        QMessageBox.information(
-            self, "Hoàn tất",
-            f"Đã nạp {so_dong} dòng quy tắc từ file.\n"
-            f"Tổng số quy tắc hiện có trong CSDL: {tong_so}."
-        )
-        self.refresh_rules_table()
-
-    def on_rule_failed(self, msg):
-        self.load_rules_btn.setEnabled(True)
-        QMessageBox.critical(self, "Lỗi", msg)
-
-    # --- Nhóm 2: danh sách quy tắc hiện có (xem / xoá) ---
-
-    def refresh_rules_table(self):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            ensure_rules_table(conn)
-            df = pd.read_sql_query(
-                "SELECT * FROM QUY_TAC_BENH ORDER BY MA_CHUYEN_DE, MA_CP, MA_BENH", conn
-            )
-            conn.close()
-            self.rules_table_df = df
-            fill_table_widget(
-                self.rules_table, df,
-                ["MA_CHUYEN_DE", "TEN_CHUYEN_DE", "MA_CP", "TEN_CP", "MA_BENH", "TEN_BENH", "NHOM_BENH"]
-            )
-            self.append_log(f"Đã tải {len(df)} dòng quy tắc hiện có trong CSDL.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách quy tắc:\n{e}")
-
-    def _get_selected_rule_row(self):
-        row_idx = self.rules_table.currentRow()
-        if row_idx < 0 or self.rules_table_df is None or row_idx >= len(self.rules_table_df):
-            QMessageBox.warning(self, "Chưa chọn dòng", "Vui lòng chọn 1 dòng quy tắc trong bảng trước.")
-            return None
-        return self.rules_table_df.iloc[row_idx]
-
-    def delete_selected_rule(self):
-        r = self._get_selected_rule_row()
-        if r is None:
-            return
-        reply = QMessageBox.question(
-            self, "Xác nhận xoá",
-            f"Xoá quy tắc:\nMã chuyên đề = {r['MA_CHUYEN_DE']}\nMA_CP = {r['MA_CP']}\n"
-            f"MA_BENH = {r['MA_BENH']}\n\nBạn có chắc chắn?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            ensure_rules_table(conn)
-            conn.execute(
-                "DELETE FROM QUY_TAC_BENH WHERE MA_CHUYEN_DE=? AND MA_CP=? AND MA_BENH=?",
-                (r["MA_CHUYEN_DE"], r["MA_CP"], r["MA_BENH"])
-            )
-            conn.commit()
-            conn.close()
-            self.append_log(
-                f"Đã xoá quy tắc: {r['MA_CHUYEN_DE']} / {r['MA_CP']} / {r['MA_BENH']}."
-            )
-            self.refresh_rules_table()
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không xoá được quy tắc:\n{e}")
-
-
-# ============================================================
-# TRANG 6: KIỂM TRA HỒ SƠ THEO QUY TẮC GIÁM ĐỊNH
-# ============================================================
-
-class RuleCheckPage(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.check_file_columns = []
-        self.violations_df = None
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
-
-        layout.addWidget(page_title("Kiểm tra hồ sơ theo quy tắc giám định"))
-        note = QLabel(
-            "Rà soát hàng loạt hồ sơ theo quy tắc đã định nghĩa ở trang '🛠 Quản lý quy tắc "
-            "giám định'. Dữ liệu được đọc trực tiếp từ 1 CSDL SQLite ngoài (ví dụ "
-            "xml123.sqlite) và việc xác định dòng SAI được thực hiện bằng 1 câu lệnh SQL "
-            "duy nhất (đối chiếu bảng dữ liệu với bảng quy tắc), không lặp qua từng dòng "
-            "bằng Python — phù hợp với dữ liệu lớn. Nếu MA_CP được dùng nhưng cả MA_BENH "
-            "và MA_BENH_KHAC (nhiều mã cách nhau bởi dấu ';') đều KHÔNG thuộc danh sách mã "
-            "bệnh cho phép, hồ sơ đó bị coi là chỉ định SAI quy định."
-        )
-        note.setWordWrap(True)
-        note.setObjectName("noteLabel")
-        layout.addWidget(note)
-
-        # --- Nhóm 1: Nguồn dữ liệu CSDL SQLite & khai báo cột ---
-        check_group = QGroupBox("1. Nguồn dữ liệu CSDL SQLite ngoài & khai báo cột")
-        check_form = QFormLayout()
-
-        self.check_db_path_edit = QLineEdit()
-        browse_check_db_btn = QPushButton("Chọn file CSDL SQLite ngoài...")
-        browse_check_db_btn.clicked.connect(self.browse_check_db)
-        row_db = QHBoxLayout()
-        row_db.addWidget(self.check_db_path_edit)
-        row_db.addWidget(browse_check_db_btn)
-        check_form.addRow("File CSDL SQLite (ví dụ xml123.sqlite):", row_db)
-
-        self.check_db_table_combo = QComboBox()
-        check_form.addRow("Bảng dữ liệu:", self.check_db_table_combo)
-
-        self.read_check_cols_btn = QPushButton("Đọc cột dữ liệu")
-        self.read_check_cols_btn.clicked.connect(self.load_check_columns)
-        check_form.addRow("", self.read_check_cols_btn)
-
-        self.check_col_ma_cp_combo = QComboBox()
-        check_form.addRow("Cột MA_CP:", self.check_col_ma_cp_combo)
-        self.check_col_ma_benh_combo = QComboBox()
-        check_form.addRow("Cột MA_BENH:", self.check_col_ma_benh_combo)
-        self.check_col_ma_benh_khac_combo = QComboBox()
-        check_form.addRow("Cột MA_BENH_KHAC:", self.check_col_ma_benh_khac_combo)
-        self.check_col_ma_chuyen_de_combo = QComboBox()
-        check_form.addRow("Cột Mã chuyên đề (nếu có):", self.check_col_ma_chuyen_de_combo)
-
-        self.ma_ly_do_tc_edit = QLineEdit("CHOT_3")
-        check_form.addRow("Mã lý do từ chối (MA_LY_DO_TC):", self.ma_ly_do_tc_edit)
-
-        self.ly_do_tc_edit = QLineEdit(DEFAULT_LY_DO_TC_TEMPLATE)
-        check_form.addRow("Nội dung lý do (LY_DO_TC):", self.ly_do_tc_edit)
-        ly_do_hint = QLabel(
-            "Có thể dùng các chỗ giữ chỗ: {MA_CP} {MA_BENH} {MA_BENH_KHAC} {NHOM_BENH} "
-            "{DANH_SACH_MA_BENH}"
-        )
-        ly_do_hint.setWordWrap(True)
-        ly_do_hint.setObjectName("noteLabel")
-        check_form.addRow("", ly_do_hint)
-
-        check_group.setLayout(check_form)
-        layout.addWidget(check_group)
-
-        output_hint = QLabel(
-            "Kết quả xuất Excel sẽ chuẩn hoá đủ 25 cột: XML1_ID, MA_BN, MA_LK, HO_TEN, "
-            "MA_THE, MA_BENH, NGAY_VAO, NGAY_RA, LOAI_CP, ID_CP, NGAY_Y_LENH, MA_CP, TEN_CP, "
-            "SO_DANG_KY, SL_DC, DON_GIA_DC, TYLE_TT_DC, MUC_HUONG_DC, LY_DO_TC, MA_LY_DO_TC, "
-            "MA_CSKCB, KY_QT, T_BHTT_DTL, MA_CHUYEN_DE, CONG_VAN (giống hệt cấu trúc cột của "
-            "chức năng Tra cứu dữ liệu XML1). Cột nào nguồn dữ liệu không có sẽ để trống."
-        )
-        output_hint.setWordWrap(True)
-        output_hint.setObjectName("noteLabel")
-        layout.addWidget(output_hint)
-
-        btn_row = QHBoxLayout()
-        self.check_btn = QPushButton("Kiểm tra hồ sơ")
-        self.check_btn.setObjectName("primaryBtn")
-        self.check_btn.clicked.connect(self.run_check)
-        self.export_btn = QPushButton("Xuất dữ liệu SAI ra Excel")
-        self.export_btn.clicked.connect(self.export_violations)
-        self.export_btn.setEnabled(False)
-        btn_row.addWidget(self.check_btn)
-        btn_row.addWidget(self.export_btn)
-        layout.addLayout(btn_row)
-
-        self.progress = QProgressBar()
-        layout.addWidget(self.progress)
-
-        layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        layout.addWidget(self.log_box, stretch=1)
-
-    def append_log(self, text):
-        self.log_box.append(text)
-
-    def browse_check_db(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn file CSDL SQLite ngoài", "",
-            "SQLite Database (*.sqlite *.sqlite3 *.db);;Tất cả file (*.*)"
-        )
-        if not path:
-            return
-        self.check_db_path_edit.setText(path)
-        try:
-            conn = sqlite3.connect(path)
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            tables = [r[0] for r in cur.fetchall()]
-            conn.close()
-            self.check_db_table_combo.clear()
-            self.check_db_table_combo.addItems(tables)
-            self.append_log(f"Đã tìm thấy {len(tables)} bảng trong CSDL.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể đọc danh sách bảng:\n{e}")
-
-    def load_check_columns(self):
-        db_path = self.check_db_path_edit.text().strip()
-        table = self.check_db_table_combo.currentText().strip()
-        if not db_path or not table:
-            QMessageBox.warning(
-                self, "Thiếu thông tin",
-                "Vui lòng chọn file CSDL SQLite và bảng dữ liệu trước."
-            )
-            return
-        try:
-            conn = sqlite3.connect(db_path)
-            cur = conn.execute(f'PRAGMA table_info("{table}")')
-            columns = [row[1] for row in cur.fetchall()]
-            cur2 = conn.execute(f'SELECT COUNT(*) FROM "{table}"')
-            row_count = cur2.fetchone()[0]
-            conn.close()
-            self.check_file_columns = columns
-            self.append_log(f"Đã đọc {len(columns)} cột, {row_count} dòng từ bảng '{table}'.")
-
-            def fill_combo(combo, guesses, allow_none=False):
-                combo.clear()
-                if allow_none:
-                    combo.addItem(NONE_OPTION)
-                combo.addItems(self.check_file_columns)
-                for g in guesses:
-                    if g in self.check_file_columns:
-                        combo.setCurrentText(g)
-                        return g
-                return None
-
-            fill_combo(self.check_col_ma_cp_combo, ["MA_CP"])
-            fill_combo(self.check_col_ma_benh_combo, ["MA_BENH"])
-            fill_combo(self.check_col_ma_benh_khac_combo, ["MA_BENH_KHAC"])
-            fill_combo(self.check_col_ma_chuyen_de_combo, ["MA_CHUYEN_DE"], allow_none=True)
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được cột dữ liệu:\n{e}")
-
-    def run_check(self):
-        src_db_path = self.check_db_path_edit.text().strip()
-        src_table_name = self.check_db_table_combo.currentText().strip()
-        if not src_db_path or not os.path.isfile(src_db_path):
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file CSDL SQLite hợp lệ.")
-            return
-        if not src_table_name:
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn bảng dữ liệu.")
-            return
-
-        col_ma_cp = self.check_col_ma_cp_combo.currentText().strip()
-        if not col_ma_cp:
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn cột MA_CP.")
-            return
-        col_ma_benh = self.check_col_ma_benh_combo.currentText().strip()
-        col_ma_benh_khac = self.check_col_ma_benh_khac_combo.currentText().strip()
-        if (not col_ma_benh or col_ma_benh == NONE_OPTION) and \
-           (not col_ma_benh_khac or col_ma_benh_khac == NONE_OPTION):
-            QMessageBox.warning(
-                self, "Thiếu thông tin",
-                "Vui lòng chọn ít nhất 1 trong 2 cột MA_BENH hoặc MA_BENH_KHAC."
-            )
-            return
-        ma_ly_do_tc = self.ma_ly_do_tc_edit.text().strip() or "CHOT_3"
-        ly_do_tc_template = self.ly_do_tc_edit.text().strip() or DEFAULT_LY_DO_TC_TEMPLATE
-
-        self.check_btn.setEnabled(False)
-        self.export_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.log_box.clear()
-
-        self.check_worker = RuleCheckWorker(
-            src_db_path, src_table_name,
-            col_ma_cp, col_ma_benh, col_ma_benh_khac,
-            self.check_col_ma_chuyen_de_combo.currentText().strip(),
-            ma_ly_do_tc, ly_do_tc_template,
-        )
-        self.check_worker.log.connect(self.append_log)
-        self.check_worker.progress.connect(self.progress.setValue)
-        self.check_worker.finished_ok.connect(self.on_check_done)
-        self.check_worker.failed.connect(self.on_check_failed)
-        self.check_worker.start()
-
-    def on_check_done(self, violations_df, total, so_co_quy_tac, so_vi_pham):
-        self.violations_df = violations_df
-        self.check_btn.setEnabled(True)
-        self.export_btn.setEnabled(so_vi_pham > 0)
-        if so_vi_pham == 0:
-            QMessageBox.information(
-                self, "Hoàn tất",
-                f"Đã kiểm tra {total} dòng ({so_co_quy_tac} dòng có quy tắc áp dụng). "
-                "Không phát hiện dòng nào chỉ định sai quy định."
-            )
-        else:
-            QMessageBox.warning(
-                self, "Phát hiện chỉ định sai",
-                f"Đã kiểm tra {total} dòng ({so_co_quy_tac} dòng có quy tắc áp dụng).\n"
-                f"Phát hiện {so_vi_pham} dòng chỉ định SAI quy định. Bấm 'Xuất dữ liệu SAI "
-                "ra Excel' để xem chi tiết."
-            )
-
-    def on_check_failed(self, msg):
-        self.check_btn.setEnabled(True)
-        QMessageBox.critical(self, "Lỗi", msg)
-
-    def export_violations(self):
-        if self.violations_df is None or self.violations_df.empty:
-            QMessageBox.warning(self, "Không có dữ liệu", "Chưa có dòng nào sai để xuất.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Lưu dữ liệu chỉ định sai", "ho_so_chi_dinh_sai.xlsx", "Excel (*.xlsx)"
-        )
-        if not path:
-            return
-        try:
-            self.violations_df.to_excel(path, index=False)
-            QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
-
-
-# ============================================================
-# TRANG 7: ĐỊNH NGHĨA CHUYÊN ĐỀ (ĐIỀU KIỆN SQL TUỲ Ý)
+# TRANG 5: ĐỊNH NGHĨA CHUYÊN ĐỀ (ĐIỀU KIỆN SQL TUỲ Ý)
 # ============================================================
 
 class TopicManagePage(QWidget):
     def __init__(self):
         super().__init__()
-        self.topic_file_columns = []
         self.topics_table_df = None
         self._build_ui()
         self.refresh_topics_table()
@@ -2723,52 +1843,17 @@ class TopicManagePage(QWidget):
         self.save_def_btn.clicked.connect(self.run_save_def)
         layout.addWidget(self.save_def_btn)
 
-        # --- Nhóm 2: Nạp hàng loạt bằng Excel ---
-        excel_group = QGroupBox("2. Nạp hàng loạt bằng file Excel (tuỳ chọn)")
-        excel_form = QFormLayout()
-        self.topic_path_edit = QLineEdit()
-        browse_topic_btn = QPushButton("Chọn file Excel...")
-        browse_topic_btn.clicked.connect(self.browse_topic_file)
-        row1 = QHBoxLayout()
-        row1.addWidget(self.topic_path_edit)
-        row1.addWidget(browse_topic_btn)
-        excel_form.addRow("File Excel định nghĩa chuyên đề:", row1)
-
-        self.read_topic_cols_btn = QPushButton("Đọc cột của file")
-        self.read_topic_cols_btn.clicked.connect(self.load_topic_columns)
-        excel_form.addRow("", self.read_topic_cols_btn)
-
-        self.topic_col_ma_cd_combo = QComboBox()
-        excel_form.addRow("Cột Mã chuyên đề:", self.topic_col_ma_cd_combo)
-        self.topic_col_ten_cd_combo = QComboBox()
-        excel_form.addRow("Cột Tên chuyên đề (nếu có):", self.topic_col_ten_cd_combo)
-        self.topic_col_ten_sheet_combo = QComboBox()
-        excel_form.addRow("Cột Tên sheet (nếu có):", self.topic_col_ten_sheet_combo)
-        self.topic_col_cot_combo = QComboBox()
-        excel_form.addRow("Cột Danh sách cột lấy (nếu có):", self.topic_col_cot_combo)
-        self.topic_col_canh_bao_combo = QComboBox()
-        excel_form.addRow("Cột Nội dung cảnh báo (nếu có):", self.topic_col_canh_bao_combo)
-        self.topic_col_dieu_kien_combo = QComboBox()
-        excel_form.addRow("Cột Điều kiện SQL:", self.topic_col_dieu_kien_combo)
-
-        excel_group.setLayout(excel_form)
-        layout.addWidget(excel_group)
-
-        self.load_topics_btn = QPushButton("Nạp / Cập nhật từ Excel vào CSDL")
-        self.load_topics_btn.clicked.connect(self.run_load_topics)
-        layout.addWidget(self.load_topics_btn)
-
         db_info = QLabel(
             f"📁 Chuyên đề được lưu vào bảng DINH_NGHIA_CHUYEN_DE trong CSDL DÙNG CHUNG "
             f"của toàn phần mềm: {DB_PATH}\n"
-            "Lưu/nạp trùng Mã chuyên đề sẽ tự động CẬP NHẬT thay vì tạo bản ghi trùng."
+            "Lưu trùng Mã chuyên đề sẽ tự động CẬP NHẬT thay vì tạo bản ghi trùng."
         )
         db_info.setWordWrap(True)
         db_info.setObjectName("noteLabel")
         layout.addWidget(db_info)
 
-        # --- Nhóm 3: Danh sách chuyên đề hiện có ---
-        list_group = QGroupBox("3. Danh sách chuyên đề hiện có")
+        # --- Nhóm 2: Danh sách chuyên đề hiện có ---
+        list_group = QGroupBox("2. Danh sách chuyên đề hiện có")
         list_layout = QVBoxLayout()
         list_btn_row = QHBoxLayout()
         self.refresh_topics_btn = QPushButton("Tải lại danh sách")
@@ -2798,7 +1883,7 @@ class TopicManagePage(QWidget):
     def append_log(self, text):
         self.log_box.append(text)
 
-    # --- Nhóm 1: thêm/cập nhật thủ công ---
+    # --- Thêm/cập nhật thủ công ---
 
     def run_save_def(self):
         ma_cd = self.def_ma_cd_edit.text().strip().upper()
@@ -2827,94 +1912,7 @@ class TopicManagePage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không lưu được chuyên đề:\n{e}")
 
-    # --- Nhóm 2: nạp Excel ---
-
-    def browse_topic_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Chọn file Excel định nghĩa chuyên đề", "",
-            "Excel/CSV (*.xlsx *.xls *.csv);;Tất cả file (*.*)"
-        )
-        if not path:
-            return
-        self.topic_path_edit.setText(path)
-        self.load_topic_columns()
-
-    def load_topic_columns(self):
-        path = self.topic_path_edit.text().strip()
-        if not path:
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel trước.")
-            return
-        try:
-            df = read_table_any(path)
-            self.topic_file_columns = list(df.columns)
-
-            def fill_combo(combo, guesses, allow_none=False):
-                combo.clear()
-                if allow_none:
-                    combo.addItem(NONE_OPTION)
-                combo.addItems(self.topic_file_columns)
-                for g in guesses:
-                    if g in self.topic_file_columns:
-                        combo.setCurrentText(g)
-                        return g
-                return None
-
-            fill_combo(self.topic_col_ma_cd_combo, ["MA_CHUYEN_DE"])
-            fill_combo(self.topic_col_ten_cd_combo, ["TEN_CHUYEN_DE"], allow_none=True)
-            fill_combo(self.topic_col_ten_sheet_combo, ["TEN_SHEET"], allow_none=True)
-            fill_combo(self.topic_col_cot_combo, ["DANH_SACH_COT"], allow_none=True)
-            fill_combo(self.topic_col_canh_bao_combo, ["NOI_DUNG_CANH_BAO"], allow_none=True)
-            fill_combo(self.topic_col_dieu_kien_combo, ["DIEU_KIEN_SQL"])
-
-            self.append_log(f"Đã đọc {len(self.topic_file_columns)} cột, {len(df)} dòng từ file.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được file:\n{e}")
-
-    def run_load_topics(self):
-        path = self.topic_path_edit.text().strip()
-        if not path or not os.path.isfile(path):
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel hợp lệ.")
-            return
-        col_ma_cd = self.topic_col_ma_cd_combo.currentText().strip()
-        col_dieu_kien = self.topic_col_dieu_kien_combo.currentText().strip()
-        if not col_ma_cd or not col_dieu_kien:
-            QMessageBox.warning(
-                self, "Thiếu thông tin",
-                "Vui lòng chọn đủ cột Mã chuyên đề và Điều kiện SQL."
-            )
-            return
-
-        self.load_topics_btn.setEnabled(False)
-        self.progress.setValue(0)
-        self.log_box.clear()
-
-        self.topic_worker = TopicDefLoadWorker(
-            path, col_ma_cd,
-            self.topic_col_ten_cd_combo.currentText().strip(),
-            self.topic_col_ten_sheet_combo.currentText().strip(),
-            self.topic_col_cot_combo.currentText().strip(),
-            self.topic_col_canh_bao_combo.currentText().strip(),
-            col_dieu_kien,
-        )
-        self.topic_worker.log.connect(self.append_log)
-        self.topic_worker.progress.connect(self.progress.setValue)
-        self.topic_worker.finished_ok.connect(self.on_topics_loaded)
-        self.topic_worker.failed.connect(self.on_topic_load_failed)
-        self.topic_worker.start()
-
-    def on_topics_loaded(self, so_dong, tong_so):
-        self.load_topics_btn.setEnabled(True)
-        QMessageBox.information(
-            self, "Hoàn tất",
-            f"Đã nạp {so_dong} chuyên đề từ file.\nTổng số hiện có: {tong_so}."
-        )
-        self.refresh_topics_table()
-
-    def on_topic_load_failed(self, msg):
-        self.load_topics_btn.setEnabled(True)
-        QMessageBox.critical(self, "Lỗi", msg)
-
-    # --- Nhóm 3: danh sách hiện có ---
+    # --- Danh sách hiện có ---
 
     def refresh_topics_table(self):
         try:
@@ -2956,7 +1954,7 @@ class TopicManagePage(QWidget):
 
 
 # ============================================================
-# TRANG 8: CHẠY CHUYÊN ĐỀ THEO KỲ
+# TRANG 6: CHẠY CHUYÊN ĐỀ THEO KỲ
 # ============================================================
 
 class TopicRunPage(QWidget):
@@ -3187,6 +2185,553 @@ class TopicRunPage(QWidget):
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
+
+
+# ============================================================
+# WORKER: GHÉP NHIỀU FILE EXCEL TRONG FOLDER THÀNH 1 FILE NHIỀU SHEET
+# ============================================================
+
+class MergeFolderToSheetsWorker(QThread):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(int, int, int)  # total_files, total_sheets, total_rows
+    failed = pyqtSignal(str)
+
+    def __init__(self, folder_path, output_path, read_all_sheets=False):
+        super().__init__()
+        self.folder_path = folder_path
+        self.output_path = output_path
+        self.read_all_sheets = read_all_sheets
+
+    def run(self):
+        try:
+            self.log.emit("Đang quét các file Excel trong thư mục...")
+            all_entries = sorted(os.listdir(self.folder_path))
+            excel_files = []
+            for fname in all_entries:
+                if fname.startswith("~$"):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in (".xlsx", ".xls", ".xlsm"):
+                    excel_files.append(fname)
+
+            if not excel_files:
+                raise ValueError("Không tìm thấy file Excel (.xlsx, .xls, .xlsm) nào trong thư mục đã chọn.")
+
+            total_files = len(excel_files)
+            self.log.emit(f"Tìm thấy {total_files} file Excel hợp lệ. Bắt đầu ghép...")
+            self.progress.emit(10)
+
+            used_sheet_names = set()
+            total_sheets_written = 0
+            total_rows_written = 0
+
+            with pd.ExcelWriter(self.output_path, engine="openpyxl") as writer:
+                for idx, fname in enumerate(excel_files, start=1):
+                    fpath = os.path.join(self.folder_path, fname)
+                    file_stem = os.path.splitext(fname)[0]
+
+                    try:
+                        with pd.ExcelFile(fpath) as excel_obj:
+                            sheet_names = excel_obj.sheet_names
+                            if not sheet_names:
+                                self.log.emit(f"  [!] Bỏ qua file '{fname}' vì không có sheet nào.")
+                                continue
+
+                            sheets_to_process = sheet_names if self.read_all_sheets else [sheet_names[0]]
+
+                            for sname in sheets_to_process:
+                                try:
+                                    df = pd.read_excel(excel_obj, sheet_name=sname, dtype=str)
+                                    df = df.dropna(how="all")
+                                    df.columns = [str(c).strip() for c in df.columns]
+
+                                    if self.read_all_sheets and len(sheet_names) > 1:
+                                        raw_title = f"{file_stem}_{sname}"
+                                    else:
+                                        raw_title = file_stem
+
+                                    sheet_label = sanitize_sheet_name(raw_title, used_sheet_names)
+                                    df.to_excel(writer, sheet_name=sheet_label, index=False)
+                                    total_sheets_written += 1
+                                    total_rows_written += len(df)
+                                    self.log.emit(
+                                        f"  -> File '{fname}' | Sheet '{sname}' => Xuất thành sheet '{sheet_label}' ({len(df)} dòng)"
+                                    )
+                                except Exception as e_sheet:
+                                    self.log.emit(f"  [!] Lỗi khi đọc sheet '{sname}' trong file '{fname}': {e_sheet}")
+                    except Exception as e_open:
+                        self.log.emit(f"  [!] Bỏ qua file '{fname}' do lỗi đọc: {e_open}")
+                        continue
+
+                    pct = 10 + int(idx / total_files * 85)
+                    self.progress.emit(min(pct, 95))
+
+            if total_sheets_written == 0:
+                raise ValueError("Không có dữ liệu sheet nào được ghi vào file kết quả.")
+
+            self.progress.emit(100)
+            self.log.emit(
+                f"Đã hoàn thành! Đã ghép {total_files} file thành {total_sheets_written} sheet, "
+                f"tổng cộng {total_rows_written:,} dòng dữ liệu."
+            )
+            self.finished_ok.emit(total_files, total_sheets_written, total_rows_written)
+
+        except Exception as e:
+            self.log.emit("LỖI: " + str(e))
+            self.log.emit(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+# ============================================================
+# WORKER: GHÉP NHIỀU SHEET TRONG 1 FILE EXCEL THÀNH 1 SHEET
+# ============================================================
+
+class MergeSheetsToSingleWorker(QThread):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(object, int, int)  # merged_df, total_sheets, total_rows
+    failed = pyqtSignal(str)
+
+    def __init__(self, file_path, selected_sheets, add_sheet_col=True, sheet_col_name="TEN_SHEET", skip_empty=True):
+        super().__init__()
+        self.file_path = file_path
+        self.selected_sheets = selected_sheets
+        self.add_sheet_col = add_sheet_col
+        self.sheet_col_name = sheet_col_name.strip() or "TEN_SHEET"
+        self.skip_empty = skip_empty
+
+    def run(self):
+        try:
+            if not self.selected_sheets:
+                raise ValueError("Không có sheet nào được chọn để ghép.")
+
+            self.log.emit("Đang mở file Excel...")
+            total = len(self.selected_sheets)
+            self.progress.emit(10)
+
+            dfs = []
+            processed_sheets = 0
+
+            with pd.ExcelFile(self.file_path) as excel_obj:
+                for idx, sname in enumerate(self.selected_sheets, start=1):
+                    self.log.emit(f"Đang đọc sheet [{idx}/{total}]: '{sname}'...")
+                    try:
+                        df = pd.read_excel(excel_obj, sheet_name=sname, dtype=str)
+                        df.columns = [str(c).strip() for c in df.columns]
+                        df = df.dropna(how="all")
+
+                        if df.empty and self.skip_empty:
+                            self.log.emit(f"  -> Sheet '{sname}' rỗng, bỏ qua.")
+                            continue
+
+                        if self.add_sheet_col:
+                            if self.sheet_col_name in df.columns:
+                                df[self.sheet_col_name] = sname
+                            else:
+                                df.insert(0, self.sheet_col_name, sname)
+
+                        dfs.append(df)
+                        processed_sheets += 1
+                        self.log.emit(f"  -> Sheet '{sname}': {len(df)} dòng, {len(df.columns)} cột.")
+                    except Exception as e_s:
+                        self.log.emit(f"  [!] Lỗi khi đọc sheet '{sname}': {e_s}")
+
+                    pct = 10 + int(idx / total * 75)
+                    self.progress.emit(min(pct, 85))
+
+            if not dfs:
+                raise ValueError("Tất cả các sheet được chọn đều rỗng hoặc bị lỗi khi đọc.")
+
+            self.log.emit("Đang tổng hợp và khớp nối các cột dữ liệu...")
+            merged_df = pd.concat(dfs, ignore_index=True, sort=False)
+            merged_df = merged_df.fillna("")
+
+            self.progress.emit(100)
+            self.log.emit(
+                f"Ghép hoàn tất! Tổng cộng {processed_sheets} sheet được gộp thành 1 sheet "
+                f"với {len(merged_df):,} dòng và {len(merged_df.columns)} cột."
+            )
+            self.finished_ok.emit(merged_df, processed_sheets, len(merged_df))
+
+        except Exception as e:
+            self.log.emit("LỖI: " + str(e))
+            self.log.emit(traceback.format_exc())
+            self.failed.emit(str(e))
+
+
+# ============================================================
+# TRANG: GHÉP NHIỀU FILE EXCEL TRONG FOLDER THÀNH 1 FILE NHIỀU SHEET
+# ============================================================
+
+class MergeFolderToSheetsPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        layout.addWidget(page_title("Ghép Folder Excel thành 1 file nhiều Sheet"))
+        note = QLabel(
+            "Đọc toàn bộ các file Excel (.xlsx, .xls, .xlsm) trong một thư mục và ghép vào một file "
+            "Excel duy nhất. Tên sheet sẽ tự động được đặt theo tên file nguồn (và tên sheet con) "
+            "với độ dài chuẩn <= 31 ký tự theo quy định của Excel."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("noteLabel")
+        layout.addWidget(note)
+
+        group = QGroupBox("Cấu hình ghép file")
+        form = QFormLayout()
+
+        # Chọn thư mục nguồn
+        self.folder_path_edit = QLineEdit()
+        browse_dir_btn = QPushButton("Chọn thư mục...")
+        browse_dir_btn.clicked.connect(self.browse_folder)
+        row1 = QHBoxLayout()
+        row1.addWidget(self.folder_path_edit)
+        row1.addWidget(browse_dir_btn)
+        form.addRow("Thư mục chứa các file Excel:", row1)
+
+        # Chế độ đọc
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Chỉ lấy Sheet đầu tiên của mỗi file (Tên Sheet = Tên file)", False)
+        self.mode_combo.addItem("Lấy tất cả Sheet của mỗi file (Tên Sheet = Tên file_Tên sheet)", True)
+        form.addRow("Chế độ lấy Sheet:", self.mode_combo)
+
+        # File Excel kết quả
+        self.output_path_edit = QLineEdit()
+        browse_out_btn = QPushButton("Chọn nơi lưu file...")
+        browse_out_btn.clicked.connect(self.browse_output_file)
+        row2 = QHBoxLayout()
+        row2.addWidget(self.output_path_edit)
+        row2.addWidget(browse_out_btn)
+        form.addRow("File Excel kết quả (.xlsx):", row2)
+
+        group.setLayout(form)
+        layout.addWidget(group)
+
+        self.start_btn = QPushButton("Bắt đầu ghép các file Excel")
+        self.start_btn.setObjectName("primaryBtn")
+        self.start_btn.clicked.connect(self.run_merge)
+        layout.addWidget(self.start_btn)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+
+        layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box, stretch=1)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa các file Excel")
+        if not folder:
+            return
+        self.folder_path_edit.setText(folder)
+
+        default_out = os.path.join(folder, "TONG_HOP_CAC_FILE.xlsx")
+        self.output_path_edit.setText(default_out)
+
+        try:
+            files = [
+                f for f in os.listdir(folder)
+                if not f.startswith("~$") and os.path.splitext(f)[1].lower() in (".xlsx", ".xls", ".xlsm")
+            ]
+            self.append_log(f"Đã chọn thư mục: '{folder}' (tìm thấy {len(files)} file Excel).")
+        except Exception:
+            self.append_log(f"Đã chọn thư mục: '{folder}'.")
+
+    def browse_output_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Chọn nơi lưu file Excel kết quả",
+            self.output_path_edit.text() or "TONG_HOP_CAC_FILE.xlsx",
+            "Excel (*.xlsx)"
+        )
+        if path:
+            self.output_path_edit.setText(path)
+
+    def run_merge(self):
+        folder_path = self.folder_path_edit.text().strip()
+        output_path = self.output_path_edit.text().strip()
+        read_all = self.mode_combo.currentData()
+
+        if not folder_path or not os.path.isdir(folder_path):
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn thư mục chứa các file Excel hợp lệ.")
+            return
+        if not output_path:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn đường dẫn file Excel kết quả.")
+            return
+
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+            self.output_path_edit.setText(output_path)
+
+        self.start_btn.setEnabled(False)
+        self.progress.setValue(0)
+        self.log_box.clear()
+
+        self.worker = MergeFolderToSheetsWorker(folder_path, output_path, read_all_sheets=bool(read_all))
+        self.worker.log.connect(self.append_log)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.finished_ok.connect(self.on_merge_done)
+        self.worker.failed.connect(self.on_merge_failed)
+        self.worker.start()
+
+    def on_merge_done(self, total_files, total_sheets, total_rows):
+        self.start_btn.setEnabled(True)
+        out_path = self.output_path_edit.text().strip()
+        QMessageBox.information(
+            self, "Hoàn tất ghép file",
+            f"Đã ghép thành công {total_files} file thành {total_sheets} sheet trong 1 file Excel!\n"
+            f"Tổng số dòng: {total_rows:,}\n\n"
+            f"Đường dẫn file: {out_path}"
+        )
+
+    def on_merge_failed(self, msg):
+        self.start_btn.setEnabled(True)
+        QMessageBox.critical(self, "Lỗi khi ghép file", msg)
+
+
+# ============================================================
+# TRANG: GHÉP NHIỀU SHEET THÀNH 1 SHEET TRONG FILE EXCEL
+# ============================================================
+
+class MergeSheetsToSinglePage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.merged_df = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        layout.addWidget(page_title("Ghép nhiều Sheet thành 1 Sheet duy nhất"))
+        note = QLabel(
+            "Chọn 1 file Excel có nhiều sheet để gộp tất cả các dòng dữ liệu vào 1 sheet duy nhất. "
+            "Chương trình sẽ tự động khớp các cột trùng tên giữa các sheet và cho phép tùy chọn "
+            "thêm cột ghi rõ nguồn sheet."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("noteLabel")
+        layout.addWidget(note)
+
+        group = QGroupBox("File nguồn & Chọn Sheet cần ghép")
+        form = QFormLayout()
+
+        # Chọn file Excel nguồn
+        self.file_path_edit = QLineEdit()
+        browse_file_btn = QPushButton("Chọn file Excel...")
+        browse_file_btn.clicked.connect(self.browse_file)
+        row1 = QHBoxLayout()
+        row1.addWidget(self.file_path_edit)
+        row1.addWidget(browse_file_btn)
+        form.addRow("File Excel nguồn:", row1)
+
+        # Danh sách Sheet
+        sheet_box = QVBoxLayout()
+        self.sheet_list = QListWidget()
+        self.sheet_list.setFixedHeight(140)
+        sheet_box.addWidget(self.sheet_list)
+
+        btn_sheet_row = QHBoxLayout()
+        select_all_btn = QPushButton("Chọn tất cả")
+        select_all_btn.clicked.connect(self.select_all_sheets)
+        deselect_all_btn = QPushButton("Bỏ chọn tất cả")
+        deselect_all_btn.clicked.connect(self.deselect_all_sheets)
+        btn_sheet_row.addWidget(select_all_btn)
+        btn_sheet_row.addWidget(deselect_all_btn)
+        btn_sheet_row.addStretch()
+        sheet_box.addLayout(btn_sheet_row)
+
+        form.addRow("Danh sách Sheet trong file:", sheet_box)
+
+        # Tùy chọn
+        self.add_origin_check = QCheckBox("Thêm cột ghi rõ tên Sheet nguồn")
+        self.add_origin_check.setChecked(True)
+        self.origin_col_edit = QLineEdit("TEN_SHEET")
+        self.origin_col_edit.setPlaceholderText("Tên cột (mặc định: TEN_SHEET)")
+
+        col_row = QHBoxLayout()
+        col_row.addWidget(self.add_origin_check)
+        col_row.addWidget(QLabel("Tên cột:"))
+        col_row.addWidget(self.origin_col_edit)
+        form.addRow("Cột nguồn sheet:", col_row)
+
+        self.skip_empty_check = QCheckBox("Bỏ qua các sheet không có dòng dữ liệu nào")
+        self.skip_empty_check.setChecked(True)
+        form.addRow("Tùy chọn khác:", self.skip_empty_check)
+
+        group.setLayout(form)
+        layout.addWidget(group)
+
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton("Bắt đầu ghép các sheet")
+        self.start_btn.setObjectName("primaryBtn")
+        self.start_btn.clicked.connect(self.run_merge)
+
+        self.export_btn = QPushButton("Xuất kết quả ra file Excel...")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_merged_excel)
+
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.export_btn)
+        layout.addLayout(btn_row)
+
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+
+        # Preview table & log
+        split_layout = QHBoxLayout()
+
+        left_box = QVBoxLayout()
+        left_box.addWidget(QLabel("Xem trước dữ liệu sau khi ghép (tối đa 500 dòng):"))
+        self.table_preview = QTableWidget()
+        left_box.addWidget(self.table_preview)
+
+        right_box = QVBoxLayout()
+        right_box.addWidget(QLabel("Nhật ký xử lý:"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        right_box.addWidget(self.log_box)
+
+        split_layout.addLayout(left_box, 6)
+        split_layout.addLayout(right_box, 4)
+        layout.addLayout(split_layout, stretch=1)
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file Excel nguồn", "",
+            "Excel (*.xlsx *.xls *.xlsm);;Tất cả file (*.*)"
+        )
+        if not path:
+            return
+        self.file_path_edit.setText(path)
+        self.load_sheets(path)
+
+    def load_sheets(self, path):
+        try:
+            with pd.ExcelFile(path) as excel_obj:
+                sheets = excel_obj.sheet_names
+            self.sheet_list.clear()
+            for sname in sheets:
+                item = QListWidgetItem(sname)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked)
+                self.sheet_list.addItem(item)
+            self.append_log(f"Đã đọc file: '{os.path.basename(path)}' - Tìm thấy {len(sheets)} sheet.")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không đọc được danh sách sheet từ file:\n{e}")
+
+    def select_all_sheets(self):
+        for i in range(self.sheet_list.count()):
+            item = self.sheet_list.item(i)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def deselect_all_sheets(self):
+        for i in range(self.sheet_list.count()):
+            item = self.sheet_list.item(i)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+    def get_selected_sheets(self):
+        selected = []
+        for i in range(self.sheet_list.count()):
+            item = self.sheet_list.item(i)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                selected.append(item.text())
+        return selected
+
+    def run_merge(self):
+        file_path = self.file_path_edit.text().strip()
+        if not file_path or not os.path.isfile(file_path):
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel nguồn hợp lệ.")
+            return
+
+        selected_sheets = self.get_selected_sheets()
+        if not selected_sheets:
+            QMessageBox.warning(self, "Chưa chọn Sheet", "Vui lòng chọn ít nhất 1 sheet để ghép.")
+            return
+
+        add_col = self.add_origin_check.isChecked()
+        col_name = self.origin_col_edit.text().strip() or "TEN_SHEET"
+        skip_empty = self.skip_empty_check.isChecked()
+
+        self.start_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.progress.setValue(0)
+        self.log_box.clear()
+        self.table_preview.clear()
+        self.table_preview.setRowCount(0)
+        self.table_preview.setColumnCount(0)
+
+        self.worker = MergeSheetsToSingleWorker(
+            file_path, selected_sheets,
+            add_sheet_col=add_col,
+            sheet_col_name=col_name,
+            skip_empty=skip_empty
+        )
+        self.worker.log.connect(self.append_log)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.finished_ok.connect(self.on_merge_done)
+        self.worker.failed.connect(self.on_merge_failed)
+        self.worker.start()
+
+    def on_merge_done(self, merged_df, total_sheets, total_rows):
+        self.merged_df = merged_df
+        self.start_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+
+        cols = list(merged_df.columns)
+        fill_table_widget(self.table_preview, merged_df, cols, max_rows=500)
+
+        QMessageBox.information(
+            self, "Ghép thành công",
+            f"Đã ghép thành công {total_sheets} sheet thành 1 sheet duy nhất!\n"
+            f"Tổng số dòng: {total_rows:,}\n"
+            f"Tổng số cột: {len(cols)}"
+        )
+
+    def on_merge_failed(self, msg):
+        self.start_btn.setEnabled(True)
+        QMessageBox.critical(self, "Lỗi ghép sheet", msg)
+
+    def export_merged_excel(self):
+        if self.merged_df is None or self.merged_df.empty:
+            QMessageBox.warning(self, "Không có dữ liệu", "Chưa có dữ liệu ghép để xuất.")
+            return
+
+        src_path = self.file_path_edit.text().strip()
+        default_name = "GHEP_CAC_SHEET.xlsx"
+        if src_path:
+            base = os.path.splitext(os.path.basename(src_path))[0]
+            default_name = f"{base}_GHEP_1_SHEET.xlsx"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Lưu file Excel đã ghép", default_name, "Excel (*.xlsx)"
+        )
+        if not path:
+            return
+        try:
+            self.merged_df.to_excel(path, sheet_name="TONG_HOP", index=False)
+            QMessageBox.information(
+                self, "Xuất file thành công",
+                f"Đã lưu file thành công:\n{path}\n\nTổng cộng: {len(self.merged_df):,} dòng."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi khi lưu file", f"Không thể lưu file:\n{e}")
 
 
 # ============================================================
@@ -3583,10 +3128,10 @@ class MainWindow(QMainWindow):
             ("🗂", "Tách Excel theo MA_CSKCB"),
             ("📊", "Tổng hợp trừ chi phí theo chuyên đề"),
             ("💾", "Lưu hồ sơ đã trừ & Kiểm tra trùng"),
-            ("🛠", "Quản lý quy tắc giám định"),
-            ("🚨", "Kiểm tra hồ sơ theo quy tắc"),
             ("🧩", "Định nghĩa chuyên đề (SQL)"),
             ("▶️", "Chạy chuyên đề theo kỳ"),
+            ("📁", "Ghép Folder Excel -> Nhiều Sheet"),
+            ("📑", "Ghép Nhiều Sheet -> 1 Sheet"),
         ]
         self._nav_buttons = []
         for icon, label in menu_items:
@@ -3603,10 +3148,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(SplitPage())
         self.stack.addWidget(ExcludeSummaryPage())
         self.stack.addWidget(SaveDeductedPage())
-        self.stack.addWidget(RuleManagePage())
-        self.stack.addWidget(RuleCheckPage())
         self.stack.addWidget(TopicManagePage())
         self.stack.addWidget(TopicRunPage())
+        self.stack.addWidget(MergeFolderToSheetsPage())
+        self.stack.addWidget(MergeSheetsToSinglePage())
         root_layout.addWidget(self.stack, stretch=1)
 
         self.setCentralWidget(central)
