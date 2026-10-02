@@ -63,7 +63,7 @@ DB_PATH = os.path.join(get_app_dir(), "DB.sqlite")
 
 OUTPUT_COLUMNS = [
     "XML1_ID", "MA_BN", "MA_LK", "HO_TEN", "MA_THE", "MA_BENH",
-    "NGAY_VAO", "NGAY_RA", "LOAI_CP", "ID_CP", "NGAY_Y_LENH",
+    "NGAY_VAO", "NGAY_RA", "LOAI_CP", "ID_CP", "NGAY_YL",
     "MA_CP", "TEN_CP", "SO_DANG_KY",
     "SL_DC", "DON_GIA_DC", "TYLE_TT_DC", "MUC_HUONG_DC",
     "LY_DO_TC", "MA_LY_DO_TC",
@@ -2570,6 +2570,11 @@ class MergeSheetsToSinglePage(QWidget):
         self.skip_empty_check.setChecked(True)
         form.addRow("Tùy chọn khác:", self.skip_empty_check)
 
+        self.create_summary_check = QCheckBox(
+            "Tạo thêm sheet TONG_HOP, cộng T_BHTT theo MA_CSKCB"
+        )
+        form.addRow("Sheet tổng hợp:", self.create_summary_check)
+
         group.setLayout(form)
         layout.addWidget(group)
 
@@ -2725,7 +2730,29 @@ class MergeSheetsToSinglePage(QWidget):
         if not path:
             return
         try:
-            self.merged_df.to_excel(path, sheet_name="TONG_HOP", index=False)
+            if self.create_summary_check.isChecked():
+                required_columns = {"MA_CSKCB", "T_BHTT"}
+                missing_columns = required_columns.difference(self.merged_df.columns)
+                if missing_columns:
+                    raise ValueError(
+                        "Không thể tạo sheet TONG_HOP vì thiếu cột: "
+                        + ", ".join(sorted(missing_columns))
+                    )
+
+                detail_df = self.merged_df
+                summary_df = detail_df[["MA_CSKCB", "T_BHTT"]].copy()
+                summary_df["T_BHTT"] = summary_df["T_BHTT"].map(parse_money)
+                summary_df = (
+                    summary_df.groupby("MA_CSKCB", dropna=False, as_index=False)["T_BHTT"]
+                    .sum()
+                )
+                summary_df["MA_CSKCB"] = summary_df["MA_CSKCB"].fillna("")
+
+                with pd.ExcelWriter(path) as writer:
+                    detail_df.to_excel(writer, sheet_name="CHI_TIET", index=False)
+                    summary_df.to_excel(writer, sheet_name="TONG_HOP", index=False)
+            else:
+                self.merged_df.to_excel(path, sheet_name="TONG_HOP", index=False)
             QMessageBox.information(
                 self, "Xuất file thành công",
                 f"Đã lưu file thành công:\n{path}\n\nTổng cộng: {len(self.merged_df):,} dòng."
