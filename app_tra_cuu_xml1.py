@@ -71,6 +71,20 @@ OUTPUT_COLUMNS = [
     "MA_CHUYEN_DE", "CONG_VAN",
 ]
 
+CHOT2_COLUMNS = [
+    "XML1_ID", "MA_BN", "HO_TEN", "MA_THE", "MA_BENH", "MA_BENH_KHAC",
+    "NGAY_VAO", "NGAY_RA", "LOAI_CP", "ID_CP", "MA_CP", "TEN_CP",
+    "SO_DANG_KY", "SO_LUONG_DN", "DON_GIA_DN", "TYLE_TT_DN", "MUC_HUONG_DN",
+    "SL_DC", "DON_GIA_DC", "TYLE_TT_DC", "MUC_HUONG_DC", "LY_DO_TC",
+    "MA_LY_DO_TC", "MA_CSKCB", "KY_QT",
+]
+
+CHOT2_COLUMNS_NOT_IN_DB = [
+    "SO_LUONG_DN", "DON_GIA_DN", "TYLE_TT_DN", "MUC_HUONG_DN",
+    "SL_DC", "DON_GIA_DC", "TYLE_TT_DC", "MUC_HUONG_DC",
+    "LY_DO_TC", "MA_LY_DO_TC",
+]
+
 COLUMNS_NOT_IN_DB = [
     "SL_DC", "DON_GIA_DC", "TYLE_TT_DC", "MUC_HUONG_DC",
     "LY_DO_TC", "MA_LY_DO_TC",
@@ -79,8 +93,9 @@ COLUMNS_NOT_IN_DB = [
 INPUT_ONLY_COLUMNS = ["MA_CHUYEN_DE", "CONG_VAN"]
 
 DB_NEEDED_COLUMNS = [
-    c for c in OUTPUT_COLUMNS
-    if c not in COLUMNS_NOT_IN_DB and c not in INPUT_ONLY_COLUMNS
+    c for c in dict.fromkeys(OUTPUT_COLUMNS + CHOT2_COLUMNS)
+    if c not in set(COLUMNS_NOT_IN_DB + CHOT2_COLUMNS_NOT_IN_DB)
+    and c not in INPUT_ONLY_COLUMNS
 ]
 
 # --- Cột dùng cho CSDL "hồ sơ đã trừ" (chức năng Lưu hồ sơ đã trừ & Kiểm tra trùng) ---
@@ -180,6 +195,66 @@ def parse_money(x) -> float:
         return float(s)
     except ValueError:
         return 0.0
+
+
+def is_money_column(column_name: str) -> bool:
+    """Nhận diện các cột tiền thường gặp trong dữ liệu quyết toán BHYT."""
+    name = str(column_name).strip().upper()
+    return name.startswith((
+        "T_", "DON_GIA", "TIEN_", "SO_TIEN", "THANH_TIEN", "TONG_TIEN"
+    ))
+
+
+def parse_money_for_excel(value):
+    """Đổi giá trị tiền có dấu phân cách kiểu Việt Nam thành số Excel."""
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+
+    text = str(value).strip().replace("\u00a0", "")
+    text = re.sub(r"(?i)(?:đồng|vnđ|vnd|đ|₫)", "", text).replace(" ", "")
+    if not re.fullmatch(r"[+-]?(?:\d[\d.,]*|[.,]\d+)", text):
+        return value
+
+    normalized = text
+    if "," in text and "." in text:
+        decimal_separator = "," if text.rfind(",") > text.rfind(".") else "."
+        grouping_separator = "." if decimal_separator == "," else ","
+        normalized = text.replace(grouping_separator, "").replace(decimal_separator, ".")
+    elif "," in text:
+        parts = text.split(",")
+        if len(parts) > 1 and len(parts[-1]) == 3:
+            normalized = text.replace(",", "")
+        else:
+            normalized = "".join(parts[:-1]).replace(",", "") + "." + parts[-1]
+    elif text.count(".") > 1:
+        parts = text.split(".")
+        if len(parts[-1]) == 3:
+            normalized = "".join(parts)
+        else:
+            normalized = "".join(parts[:-1]) + "." + parts[-1]
+
+    try:
+        return float(normalized)
+    except ValueError:
+        return value
+
+
+def prepare_money_columns_for_excel(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Xuất các cột tiền dưới dạng số để Excel có thể áp dụng định dạng số."""
+    result = dataframe.copy()
+    for column in result.columns:
+        if is_money_column(column):
+            result[column] = result[column].map(parse_money_for_excel)
+    return result
+
+
+def apply_money_number_formats(worksheet, columns):
+    for column_index, column_name in enumerate(columns, start=1):
+        if is_money_column(column_name):
+            for row_index in range(2, worksheet.max_row + 1):
+                worksheet.cell(row=row_index, column=column_index).number_format = "#,##0.00"
 
 
 def is_note_marked(v) -> bool:
@@ -399,13 +474,14 @@ class LookupWorker(QThread):
 
             self.progress.emit(80)
 
-            for c in OUTPUT_COLUMNS:
+            result_columns = list(dict.fromkeys(OUTPUT_COLUMNS + CHOT2_COLUMNS))
+            for c in result_columns:
                 if c not in merged.columns:
                     merged[c] = ""
-            for c in COLUMNS_NOT_IN_DB:
+            for c in CHOT2_COLUMNS_NOT_IN_DB:
                 merged[c] = ""
 
-            result = merged[OUTPUT_COLUMNS].copy().fillna("")
+            result = merged[result_columns].copy().fillna("")
 
             not_found = merged["MA_BN"].isna().sum() if "MA_BN" in merged.columns else 0
             self.log.emit(
@@ -908,6 +984,8 @@ class LookupPage(QWidget):
         self.export_btn.clicked.connect(self.export_result)
         self.export_btn.setEnabled(False)
         action_row.addWidget(self.run_btn)
+        self.chot2_checkbox = QCheckBox("Xuất theo mẫu Chốt 2 (bỏ chọn: Chốt 3)")
+        action_row.addWidget(self.chot2_checkbox)
         action_row.addWidget(self.export_btn)
         layout.addLayout(action_row)
 
@@ -1060,7 +1138,9 @@ class LookupPage(QWidget):
         if not path:
             return
         try:
-            self.result_df.to_excel(path, index=False)
+            export_columns = CHOT2_COLUMNS if self.chot2_checkbox.isChecked() else OUTPUT_COLUMNS
+            export_df = self.result_df.reindex(columns=export_columns, fill_value="")
+            export_df.to_excel(path, index=False)
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
@@ -2518,7 +2598,8 @@ class MergeSheetsToSinglePage(QWidget):
         note = QLabel(
             "Chọn 1 file Excel có nhiều sheet để gộp tất cả các dòng dữ liệu vào 1 sheet duy nhất. "
             "Chương trình sẽ tự động khớp các cột trùng tên giữa các sheet và cho phép tùy chọn "
-            "thêm cột ghi rõ nguồn sheet."
+            "thêm cột ghi rõ nguồn sheet. Các cột tiền sẽ được xuất dạng số với 2 chữ số thập phân "
+            "để Excel hiển thị theo thiết lập vùng của máy."
         )
         note.setWordWrap(True)
         note.setObjectName("noteLabel")
@@ -2730,17 +2811,17 @@ class MergeSheetsToSinglePage(QWidget):
         if not path:
             return
         try:
+            detail_df = prepare_money_columns_for_excel(self.merged_df)
             if self.create_summary_check.isChecked():
                 required_columns = {"MA_CSKCB", "T_BHTT"}
-                missing_columns = required_columns.difference(self.merged_df.columns)
+                missing_columns = required_columns.difference(detail_df.columns)
                 if missing_columns:
                     raise ValueError(
                         "Không thể tạo sheet TONG_HOP vì thiếu cột: "
                         + ", ".join(sorted(missing_columns))
                     )
 
-                detail_df = self.merged_df
-                summary_df = detail_df[["MA_CSKCB", "T_BHTT"]].copy()
+                summary_df = self.merged_df[["MA_CSKCB", "T_BHTT"]].copy()
                 summary_df["T_BHTT"] = summary_df["T_BHTT"].map(parse_money)
                 summary_df = (
                     summary_df.groupby("MA_CSKCB", dropna=False, as_index=False)["T_BHTT"]
@@ -2748,11 +2829,15 @@ class MergeSheetsToSinglePage(QWidget):
                 )
                 summary_df["MA_CSKCB"] = summary_df["MA_CSKCB"].fillna("")
 
-                with pd.ExcelWriter(path) as writer:
+                with pd.ExcelWriter(path, engine="openpyxl") as writer:
                     detail_df.to_excel(writer, sheet_name="CHI_TIET", index=False)
                     summary_df.to_excel(writer, sheet_name="TONG_HOP", index=False)
+                    apply_money_number_formats(writer.sheets["CHI_TIET"], detail_df.columns)
+                    apply_money_number_formats(writer.sheets["TONG_HOP"], summary_df.columns)
             else:
-                self.merged_df.to_excel(path, sheet_name="TONG_HOP", index=False)
+                with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                    detail_df.to_excel(writer, sheet_name="TONG_HOP", index=False)
+                    apply_money_number_formats(writer.sheets["TONG_HOP"], detail_df.columns)
             QMessageBox.information(
                 self, "Xuất file thành công",
                 f"Đã lưu file thành công:\n{path}\n\nTổng cộng: {len(self.merged_df):,} dòng."

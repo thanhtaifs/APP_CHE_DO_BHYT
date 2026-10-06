@@ -51,6 +51,12 @@ MA_CHUYEN_DE, CONG_VAN
   không có trong CSDL nguồn nên luôn để **trống**, bạn tự nhập tay sau.
 - Hai cột **MA_CHUYEN_DE, CONG_VAN** lấy **trực tiếp từ file đầu vào** của bạn
   (không tra cứu CSDL).
+- Checkbox **Xuất theo mẫu Chốt 2**: chọn để xuất theo bộ cột Chốt 2
+  (`XML1_ID, MA_BN, HO_TEN, MA_THE, MA_BENH, MA_BENH_KHAC, NGAY_VAO, NGAY_RA,
+  LOAI_CP, ID_CP, MA_CP, TEN_CP, SO_DANG_KY, SO_LUONG_DN, DON_GIA_DN,
+  TYLE_TT_DN, MUC_HUONG_DN, SL_DC, DON_GIA_DC, TYLE_TT_DC, MUC_HUONG_DC,
+  LY_DO_TC, MA_LY_DO_TC, MA_CSKCB, KY_QT`). Bỏ chọn (mặc định) để xuất theo
+  bộ cột Chốt 3 ở trên. Các cột Chốt 2 không có trong CSDL nguồn sẽ để trống.
 - Nếu chỉ có XML1_ID (không có ID_CP): lấy **tất cả các dòng chi phí** của
   XML1_ID đó. Nếu có cả XML1_ID + ID_CP: đối chiếu chính xác từng dòng chi phí.
 
