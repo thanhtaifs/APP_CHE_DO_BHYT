@@ -28,7 +28,7 @@ import unicodedata
 import pandas as pd
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
@@ -359,11 +359,21 @@ def upsert_topic_def(conn, row: dict):
     conn.commit()
 
 
-def fill_table_widget(table: QTableWidget, df: pd.DataFrame, columns, max_rows=1000):
+def fill_table_widget(table: QTableWidget, df: pd.DataFrame, columns, max_rows=1000, group_by_col=None):
     table.setColumnCount(len(columns))
     table.setHorizontalHeaderLabels(columns)
     table.setRowCount(min(len(df), max_rows))
+    current_group_val = None
+    group_idx = 0
+    bg_colors = [QColor("#FFFFFF"), QColor("#FFF9C4")]
     for i, (_, row) in enumerate(df.head(max_rows).iterrows()):
+        row_bg = None
+        if group_by_col and group_by_col in df.columns:
+            val_group = row[group_by_col]
+            if val_group != current_group_val:
+                current_group_val = val_group
+                group_idx = (group_idx + 1) % len(bg_colors)
+            row_bg = bg_colors[group_idx]
         for j, col in enumerate(columns):
             val = row[col] if col in df.columns else ""
             try:
@@ -371,6 +381,8 @@ def fill_table_widget(table: QTableWidget, df: pd.DataFrame, columns, max_rows=1
             except Exception:
                 is_na = False
             item = QTableWidgetItem("" if is_na else str(val))
+            if row_bg:
+                item.setBackground(row_bg)
             table.setItem(i, j, item)
     table.resizeColumnsToContents()
 
@@ -726,8 +738,9 @@ class SummaryExcludeWorker(QThread):
 class DeductedDbWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int)
-    finished_check = pyqtSignal(object, int, int)   # trung_df, so_trung, so_kiem_tra
-    finished_save = pyqtSignal(int, int, int)        # so_da_luu, so_trung_bo_qua, tong_so
+    finished_check = pyqtSignal(object, object, int, int)           # trung_df, full_df, so_trung, so_kiem_tra
+    finished_check_file = pyqtSignal(object, object, int, int, int) # dup_df, full_df, so_dong_trung, so_nhom_trung, tong_so
+    finished_save = pyqtSignal(int, int, int)                        # so_da_luu, so_trung_bo_qua, tong_so
     failed = pyqtSignal(str)
 
     def __init__(self, db_path, input_path,
@@ -743,7 +756,7 @@ class DeductedDbWorker(QThread):
         self.col_cong_van = col_cong_van
         self.col_trang_thai = col_trang_thai
         self.gia_tri_tru = gia_tri_tru
-        self.mode = mode  # "check" hoặc "save"
+        self.mode = mode  # "check", "check_file", hoặc "save"
 
     @staticmethod
     def _ensure_table(conn):
@@ -776,6 +789,8 @@ class DeductedDbWorker(QThread):
         ]:
             if c not in df.columns:
                 raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
+
+        df["_DONG_EXCEL"] = df.index + 2
 
         if self.col_trang_thai and self.col_trang_thai != NONE_OPTION:
             if self.col_trang_thai not in df.columns:
@@ -812,6 +827,8 @@ class DeductedDbWorker(QThread):
                 missing_extra.append(c)
 
         records = pd.DataFrame(data)[DEDUCTED_ALL_COLUMNS]
+        if "_DONG_EXCEL" in df.columns:
+            records["DONG_EXCEL"] = df["_DONG_EXCEL"].values
         self.progress.emit(25)
 
         if found_extra:
@@ -828,6 +845,113 @@ class DeductedDbWorker(QThread):
 
     def run(self):
         try:
+            if self.mode == "check_file":
+                self.log.emit("Đang đọc file Excel để rà soát trùng nội dung trừ...")
+                df = read_table_any(self.input_path)
+                self.progress.emit(20)
+
+                for c, label in [
+                    (self.col_xml1, "XML1_ID"),
+                    (self.col_chuyen_de, "Mã chuyên đề"),
+                ]:
+                    if not c or c not in df.columns:
+                        raise ValueError(f"Không tìm thấy cột '{c}' (dùng cho {label}) trong file.")
+
+                df["DONG_EXCEL"] = df.index + 2
+
+                if self.col_trang_thai and self.col_trang_thai != NONE_OPTION:
+                    if self.col_trang_thai not in df.columns:
+                        raise ValueError(f"Không tìm thấy cột '{self.col_trang_thai}' trong file.")
+                    before_n = len(df)
+                    gia_tri = (self.gia_tri_tru or "").strip()
+                    mask = df[self.col_trang_thai].astype(str).str.strip().str.casefold() == gia_tri.casefold()
+                    df = df[mask].copy()
+                    self.log.emit(
+                        f"Đã lọc theo cột trạng thái '{self.col_trang_thai}' = '{gia_tri}': "
+                        f"giữ lại {len(df)}/{before_n} dòng để rà soát."
+                    )
+
+                if df.empty:
+                    raise ValueError("Không có dòng dữ liệu nào để rà soát (có thể do bộ lọc trạng thái).")
+
+                self.progress.emit(40)
+                key_xml1 = df[self.col_xml1].fillna("").astype(str).str.strip()
+                key_chuyen_de = df[self.col_chuyen_de].fillna("").astype(str).str.strip().str.upper()
+
+                has_id_cp = (
+                    bool(self.col_id_cp)
+                    and self.col_id_cp != NONE_OPTION
+                    and self.col_id_cp in df.columns
+                    and bool(df[self.col_id_cp].fillna("").astype(str).str.strip().ne("").any())
+                )
+
+                if has_id_cp:
+                    key_id_cp = df[self.col_id_cp].fillna("").astype(str).str.strip()
+                    df["_KEY_TRUNG"] = key_xml1 + "___" + key_id_cp + "___" + key_chuyen_de
+                    self.log.emit(
+                        f"Tiêu chí rà soát: Khóa [XML1_ID ('{self.col_xml1}') + ID_CP ('{self.col_id_cp}') + Chuyên đề ('{self.col_chuyen_de}')]"
+                    )
+                else:
+                    df["_KEY_TRUNG"] = key_xml1 + "___" + key_chuyen_de
+                    self.log.emit(
+                        f"Tiêu chí rà soát: Khóa [XML1_ID ('{self.col_xml1}') + Chuyên đề ('{self.col_chuyen_de}')] (không dùng ID_CP)"
+                    )
+
+                self.progress.emit(60)
+                dup_mask = df.duplicated(subset=["_KEY_TRUNG"], keep=False)
+                dup_df = df[dup_mask].copy()
+
+                tong_so = len(df)
+                so_dong_trung = len(dup_df)
+
+                # Thêm cột TRUNG_CD: trường hợp nào trùng thì đánh dấu 'X', không trùng thì để trống
+                df["TRUNG_CD"] = ""
+
+                if so_dong_trung == 0:
+                    self.progress.emit(100)
+                    self.log.emit(
+                        f"Kết quả: Tuyệt vời! Không phát hiện trùng nội dung trừ trong {tong_so} dòng của file Excel."
+                    )
+                    first_cols_full = ["TRUNG_CD", "DONG_EXCEL"]
+                    other_cols_full = [c for c in df.columns if c not in first_cols_full and not c.startswith("_")]
+                    full_df = df[first_cols_full + other_cols_full].copy()
+                    self.finished_check_file.emit(pd.DataFrame(), full_df, 0, 0, tong_so)
+                else:
+                    df.loc[dup_mask, "TRUNG_CD"] = "X"
+                    dup_df["TRUNG_CD"] = "X"
+
+                    counts = df.groupby("_KEY_TRUNG")["_KEY_TRUNG"].transform("count")
+                    dup_df["SO_LAN_TRUNG"] = counts[dup_mask]
+
+                    unique_keys = dup_df["_KEY_TRUNG"].drop_duplicates().tolist()
+                    key_to_group = {k: f"Nhóm {i+1}" for i, k in enumerate(unique_keys)}
+                    dup_df["NHOM_TRUNG"] = dup_df["_KEY_TRUNG"].map(key_to_group)
+                    so_nhom_trung = len(unique_keys)
+                    so_dong_thua = so_dong_trung - so_nhom_trung
+
+                    dup_df = dup_df.sort_values(by=["_KEY_TRUNG", "DONG_EXCEL"]).reset_index(drop=True)
+                    dup_df.drop(columns=["_KEY_TRUNG"], inplace=True)
+
+                    first_cols = ["TRUNG_CD", "NHOM_TRUNG", "SO_LAN_TRUNG", "DONG_EXCEL"]
+                    other_cols = [c for c in dup_df.columns if c not in first_cols and not c.startswith("_")]
+                    dup_df = dup_df[first_cols + other_cols]
+
+                    df["NHOM_TRUNG"] = df["_KEY_TRUNG"].map(key_to_group).fillna("")
+                    df["SO_LAN_TRUNG"] = counts.where(dup_mask, "")
+                    df.drop(columns=["_KEY_TRUNG"], inplace=True)
+
+                    first_cols_full = ["TRUNG_CD", "NHOM_TRUNG", "SO_LAN_TRUNG", "DONG_EXCEL"]
+                    other_cols_full = [c for c in df.columns if c not in first_cols_full and not c.startswith("_")]
+                    full_df = df[first_cols_full + other_cols_full].copy()
+
+                    self.progress.emit(100)
+                    self.log.emit(
+                        f"Phát hiện {so_dong_trung}/{tong_so} dòng bị trùng lặp nội dung trừ ngay trong file Excel "
+                        f"(gồm {so_nhom_trung} nhóm trùng, dư thừa {so_dong_thua} dòng)."
+                    )
+                    self.finished_check_file.emit(dup_df, full_df, so_dong_trung, so_nhom_trung, tong_so)
+                return
+
             records = self._load_records()
             if records.empty:
                 raise ValueError("Không có dòng dữ liệu nào để xử lý (có thể do bộ lọc trạng thái).")
@@ -853,11 +977,46 @@ class DeductedDbWorker(QThread):
                         db_df, on=["XML1_ID", "ID_CP", "MA_CHUYEN_DE"],
                         how="inner", suffixes=("", "_DA_LUU")
                     )
+                    merged["TRUNG_CD"] = "X"
+                    first_cols_m = ["TRUNG_CD"]
+                    if "DONG_EXCEL" in merged.columns:
+                        first_cols_m.append("DONG_EXCEL")
+                    other_cols_m = [c for c in merged.columns if c not in first_cols_m and not c.startswith("_")]
+                    merged = merged[first_cols_m + other_cols_m]
+
+                    # Xác định TRUNG_CD cho full_df của records
+                    rec_keys = (
+                        records["XML1_ID"].astype(str).str.strip() + "___" +
+                        records["ID_CP"].astype(str).str.strip() + "___" +
+                        records["MA_CHUYEN_DE"].astype(str).str.strip().str.upper()
+                    )
+                    db_keys = set(
+                        db_df["XML1_ID"].astype(str).str.strip() + "___" +
+                        db_df["ID_CP"].astype(str).str.strip() + "___" +
+                        db_df["MA_CHUYEN_DE"].astype(str).str.strip().str.upper()
+                    )
+                    is_in_db = rec_keys.isin(db_keys)
+
+                    full_df = records.copy()
+                    full_df["TRUNG_CD"] = ""
+                    full_df.loc[is_in_db, "TRUNG_CD"] = "X"
+                    first_cols_full = ["TRUNG_CD"]
+                    if "DONG_EXCEL" in full_df.columns:
+                        first_cols_full.append("DONG_EXCEL")
+                    other_cols_full = [c for c in full_df.columns if c not in first_cols_full and not c.startswith("_")]
+                    full_df = full_df[first_cols_full + other_cols_full]
+
                     self.progress.emit(100)
                     self.log.emit(
-                        f"Tìm thấy {len(merged)}/{len(records)} dòng trùng với dữ liệu đã lưu trước đó."
+                        f"Tìm thấy {len(merged)}/{len(records)} dòng trùng với dữ liệu đã lưu trước đó trong CSDL."
                     )
-                    self.finished_check.emit(merged, len(merged), len(records))
+                    intra_dup = records.duplicated(subset=["XML1_ID", "ID_CP", "MA_CHUYEN_DE"], keep=False).sum()
+                    if intra_dup > 0:
+                        self.log.emit(
+                            f"LƯU Ý: Phát hiện có {intra_dup} dòng trùng lặp nội dung trừ ngay trong file Excel đã chọn! "
+                            "Bạn có thể nhấn nút 'Rà soát trùng nội dung trừ (file Excel)' để xem chi tiết."
+                        )
+                    self.finished_check.emit(merged, full_df, len(merged), len(records))
 
                 else:  # save
                     before_dedup = len(records)
@@ -1599,6 +1758,9 @@ class SaveDeductedPage(QWidget):
     def __init__(self):
         super().__init__()
         self.input_columns = []
+        self.current_result_df = None
+        self.full_file_df = None
+        self.current_result_type = ""
         self._build_ui()
 
     def _build_ui(self):
@@ -1684,18 +1846,34 @@ class SaveDeductedPage(QWidget):
         # --- Nút hành động ---
         btn_row = QHBoxLayout()
         self.check_dup_btn = QPushButton("Kiểm tra trùng trong CSDL")
+        self.check_dup_btn.setToolTip("Đối chiếu các dòng trong file Excel với CSDL SQLite HO_SO_DA_TRU")
         self.check_dup_btn.clicked.connect(self.run_check_duplicates)
+
+        self.check_file_dup_btn = QPushButton("Rà soát trùng nội dung trừ (file Excel)")
+        self.check_file_dup_btn.setToolTip("Rà soát các dòng bị trùng lặp nội dung trừ ngay trong file Excel đã chọn")
+        self.check_file_dup_btn.clicked.connect(self.run_check_file_duplicates)
+
+        self.export_dup_btn = QPushButton("Xuất Excel kết quả trùng")
+        self.export_dup_btn.setToolTip("Xuất file Excel có cột TRUNG_CD đánh dấu 'X' cho các trường hợp trùng")
+        self.export_dup_btn.clicked.connect(self.export_duplicates_to_excel)
+        self.export_dup_btn.setEnabled(False)
+
         self.save_btn = QPushButton("Lưu vào CSDL")
         self.save_btn.setObjectName("primaryBtn")
+        self.save_btn.setToolTip("Lưu dữ liệu vào bảng HO_SO_DA_TRU trong SQLite (tự động bỏ qua dòng trùng)")
         self.save_btn.clicked.connect(self.run_save_deducted)
+
         btn_row.addWidget(self.check_dup_btn)
+        btn_row.addWidget(self.check_file_dup_btn)
+        btn_row.addWidget(self.export_dup_btn)
         btn_row.addWidget(self.save_btn)
         layout.addLayout(btn_row)
 
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
 
-        layout.addWidget(QLabel("Kết quả kiểm tra trùng (nếu có):"))
+        self.result_title_label = QLabel("Kết quả kiểm tra / rà soát trùng (nếu có):")
+        layout.addWidget(self.result_title_label)
         self.table_trung = QTableWidget()
         layout.addWidget(self.table_trung, stretch=2)
 
@@ -1706,6 +1884,16 @@ class SaveDeductedPage(QWidget):
 
     def append_log(self, text):
         self.log_box.append(text)
+
+    def _set_busy(self, busy: bool):
+        self.check_dup_btn.setEnabled(not busy)
+        self.check_file_dup_btn.setEnabled(not busy)
+        self.save_btn.setEnabled(not busy)
+        has_result = (
+            (self.current_result_df is not None and not self.current_result_df.empty)
+            or (self.full_file_df is not None and not self.full_file_df.empty)
+        )
+        self.export_dup_btn.setEnabled((not busy) and has_result)
 
     def browse_input(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1762,12 +1950,22 @@ class SaveDeductedPage(QWidget):
         col_ma_cskcb = self.col_ma_cskcb_combo.currentText().strip()
         col_xml1 = self.col_xml1_combo.currentText().strip()
         col_chuyen_de = self.col_chuyen_de_combo.currentText().strip()
-        if not col_ma_cskcb or not col_xml1 or not col_chuyen_de:
-            QMessageBox.warning(
-                self, "Thiếu thông tin",
-                "Vui lòng chọn đủ cột MA_CSKCB, XML1_ID và Mã chuyên đề."
-            )
-            return None
+
+        if mode == "check_file":
+            if not col_xml1 or not col_chuyen_de:
+                QMessageBox.warning(
+                    self, "Thiếu thông tin",
+                    "Vui lòng chọn đủ cột XML1_ID và Cột Mã chuyên đề để rà soát trùng."
+                )
+                return None
+        else:
+            if not col_ma_cskcb or not col_xml1 or not col_chuyen_de:
+                QMessageBox.warning(
+                    self, "Thiếu thông tin",
+                    "Vui lòng chọn đủ cột MA_CSKCB, XML1_ID và Mã chuyên đề."
+                )
+                return None
+
         col_id_cp = self.col_id_cp_combo.currentText().strip()
         col_cong_van = self.col_cong_van_combo.currentText().strip()
         col_trang_thai = self.col_trang_thai_combo.currentText().strip()
@@ -1785,14 +1983,74 @@ class SaveDeductedPage(QWidget):
             col_chuyen_de, col_cong_van, col_trang_thai, gia_tri_tru, mode
         )
 
+    def run_check_file_duplicates(self):
+        worker = self._build_worker("check_file")
+        if worker is None:
+            return
+        self._set_busy(True)
+        self.progress.setValue(0)
+        self.log_box.clear()
+        self.result_title_label.setText("Đang rà soát trùng nội dung trừ trong file Excel...")
+
+        self.worker = worker
+        self.worker.log.connect(self.append_log)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.finished_check_file.connect(self.on_check_file_done)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+
+    def on_check_file_done(self, dup_df, full_df, so_dong_trung, so_nhom_trung, tong_so):
+        self.current_result_df = dup_df
+        self.full_file_df = full_df
+        self.current_result_type = "trung_file"
+        self._set_busy(False)
+
+        if so_dong_trung == 0:
+            self.result_title_label.setText(
+                f"Kết quả rà soát file Excel: Không phát hiện trùng trong {tong_so} dòng đã kiểm tra"
+            )
+            self.table_trung.setRowCount(0)
+            self.table_trung.setColumnCount(0)
+            QMessageBox.information(
+                self, "Kết quả rà soát",
+                f"Tuyệt vời! Không phát hiện trùng lặp nội dung trừ trong toàn bộ {tong_so} dòng của file Excel đã chọn."
+            )
+        else:
+            so_dong_thua = so_dong_trung - so_nhom_trung
+            self.result_title_label.setText(
+                f"Kết quả rà soát file Excel: Phát hiện {so_dong_trung} dòng trùng ({so_nhom_trung} nhóm trùng) / {tong_so} dòng"
+            )
+            priority_cols = [
+                "TRUNG_CD", "NHOM_TRUNG", "SO_LAN_TRUNG", "DONG_EXCEL",
+                "MA_CSKCB", "XML1_ID", "ID_CP", "MA_CHUYEN_DE",
+                "MA_BN", "HO_TEN", "MA_CP", "TEN_CP", "CONG_VAN"
+            ]
+            display_cols = [c for c in priority_cols if c in dup_df.columns]
+            for c in dup_df.columns:
+                if c not in display_cols and not c.startswith("_"):
+                    display_cols.append(c)
+
+            fill_table_widget(self.table_trung, dup_df, display_cols, max_rows=1000, group_by_col="NHOM_TRUNG")
+
+            QMessageBox.warning(
+                self, "Phát hiện trùng nội dung trừ",
+                f"Phát hiện {so_dong_trung} dòng bị trùng lặp nội dung trừ ngay trong file Excel đã chọn!\n\n"
+                f"• Cột 'TRUNG_CD' đã được đánh dấu 'X' cho tất cả các dòng trùng.\n"
+                f"• Số nhóm trùng: {so_nhom_trung} nhóm\n"
+                f"• Số dòng dư thừa lặp lại: {so_dong_thua} dòng\n"
+                f"• Tổng số dòng kiểm tra: {tong_so} dòng\n\n"
+                "Chi tiết từng nhóm trùng hiển thị ở bảng bên dưới (tô màu phân biệt giữa các nhóm).\n"
+                "Bạn có thể nhấn nút 'Xuất Excel kết quả trùng' để lưu danh sách."
+            )
+
     def run_check_duplicates(self):
         worker = self._build_worker("check")
         if worker is None:
             return
-        self.check_dup_btn.setEnabled(False)
-        self.save_btn.setEnabled(False)
+        self._set_busy(True)
         self.progress.setValue(0)
         self.log_box.clear()
+        self.result_title_label.setText("Đang kiểm tra trùng với CSDL...")
 
         self.worker = worker
         self.worker.log.connect(self.append_log)
@@ -1801,24 +2059,80 @@ class SaveDeductedPage(QWidget):
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
 
-    def on_check_done(self, trung_df, so_trung, so_kiem_tra):
-        self.check_dup_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
-        cols = ["MA_CSKCB", "XML1_ID", "ID_CP", "MA_CHUYEN_DE", "MA_BN", "HO_TEN",
+    def on_check_done(self, trung_df, full_df, so_trung, so_kiem_tra):
+        self.current_result_df = trung_df
+        self.full_file_df = full_df
+        self.current_result_type = "trung_csdl"
+        self._set_busy(False)
+
+        cols = ["TRUNG_CD", "MA_CSKCB", "XML1_ID", "ID_CP", "MA_CHUYEN_DE", "MA_BN", "HO_TEN",
                 "CONG_VAN", "NGAY_LUU"]
         display_cols = [c for c in cols if c in trung_df.columns]
-        fill_table_widget(self.table_trung, trung_df, display_cols, max_rows=500)
+        for c in trung_df.columns:
+            if c not in display_cols and not c.startswith("_"):
+                display_cols.append(c)
+
+        fill_table_widget(self.table_trung, trung_df, display_cols, max_rows=1000)
         if so_trung == 0:
+            self.result_title_label.setText(
+                f"Kết quả kiểm tra CSDL: Không phát hiện trùng ({so_kiem_tra} dòng)"
+            )
             QMessageBox.information(
-                self, "Kết quả kiểm tra",
+                self, "Kết quả kiểm tra CSDL",
                 f"Không phát hiện trùng trong {so_kiem_tra} dòng đã kiểm tra."
             )
         else:
-            QMessageBox.warning(
-                self, "Phát hiện trùng",
-                f"Có {so_trung}/{so_kiem_tra} dòng đã tồn tại trong CSDL "
-                "(có thể đã bị trừ ở lần xử lý trước đó). Xem chi tiết ở bảng bên dưới."
+            self.result_title_label.setText(
+                f"Kết quả kiểm tra CSDL: Phát hiện {so_trung}/{so_kiem_tra} dòng đã tồn tại trong CSDL"
             )
+            QMessageBox.warning(
+                self, "Phát hiện trùng trong CSDL",
+                f"Có {so_trung}/{so_kiem_tra} dòng đã tồn tại trong CSDL "
+                "(có thể đã bị trừ ở lần xử lý trước đó).\n\n"
+                "• Cột 'TRUNG_CD' đã được đánh dấu 'X' cho các dòng trùng.\n"
+                "Xem chi tiết ở bảng bên dưới hoặc nhấn nút 'Xuất Excel kết quả trùng' để lưu danh sách."
+            )
+
+    def export_duplicates_to_excel(self):
+        has_dup = self.current_result_df is not None and not self.current_result_df.empty
+        has_full = self.full_file_df is not None and not self.full_file_df.empty
+        if not has_dup and not has_full:
+            QMessageBox.warning(self, "Thông báo", "Chưa có dữ liệu để xuất file Excel. Vui lòng chạy kiểm tra / rà soát trùng trước.")
+            return
+
+        default_name = (
+            "Ket_qua_ra_soat_trung_file.xlsx"
+            if self.current_result_type == "trung_file"
+            else "Ket_qua_kiem_tra_trung_CSDL.xlsx"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Lưu file kết quả Excel (có cột TRUNG_CD)", default_name,
+            "Excel (*.xlsx);;CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".csv"):
+                df_to_save = self.full_file_df if has_full else self.current_result_df
+                df_to_save.to_csv(path, index=False, encoding="utf-8-sig")
+            else:
+                with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                    if has_dup:
+                        self.current_result_df.to_excel(writer, sheet_name="DANH_SACH_TRUNG", index=False)
+                    if has_full:
+                        self.full_file_df.to_excel(writer, sheet_name="TOAN_BO_FILE", index=False)
+
+            msg = f"Đã xuất file thành công:\n{path}\n\n"
+            msg += "✓ Đã thêm cột 'TRUNG_CD' và đánh dấu 'X' cho các trường hợp trùng.\n"
+            if has_dup and has_full:
+                msg += f"• Sheet 'DANH_SACH_TRUNG': {len(self.current_result_df)} dòng bị trùng.\n"
+                msg += f"• Sheet 'TOAN_BO_FILE': Toàn bộ {len(self.full_file_df)} dòng của file."
+            elif has_full:
+                msg += f"• Sheet 'TOAN_BO_FILE': Toàn bộ {len(self.full_file_df)} dòng của file (không có dòng trùng)."
+            QMessageBox.information(self, "Xuất file thành công", msg)
+            self.append_log(f"Đã xuất file Excel kết quả ra: {path} (cột TRUNG_CD đánh dấu 'X' dòng trùng)")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi xuất file", f"Không thể lưu file kết quả:\n{e}")
 
     def run_save_deducted(self):
         worker = self._build_worker("save")
@@ -1835,8 +2149,7 @@ class SaveDeductedPage(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self.check_dup_btn.setEnabled(False)
-        self.save_btn.setEnabled(False)
+        self._set_busy(True)
         self.progress.setValue(0)
         self.log_box.clear()
 
@@ -1848,8 +2161,7 @@ class SaveDeductedPage(QWidget):
         self.worker.start()
 
     def on_save_done(self, so_da_luu, so_trung_bo_qua, tong_so):
-        self.check_dup_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
+        self._set_busy(False)
         QMessageBox.information(
             self, "Hoàn tất",
             f"Đã lưu mới: {so_da_luu} dòng.\n"
@@ -1858,8 +2170,7 @@ class SaveDeductedPage(QWidget):
         )
 
     def on_failed(self, msg):
-        self.check_dup_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
+        self._set_busy(False)
         QMessageBox.critical(self, "Lỗi", msg)
 
 
