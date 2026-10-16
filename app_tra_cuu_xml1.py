@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QFileDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QProgressBar, QMessageBox, QGroupBox,
-    QCheckBox, QFrame, QAbstractItemView, QSplitter
+    QCheckBox, QFrame, QAbstractItemView, QSplitter, QRadioButton, QButtonGroup
 )
 
 NONE_OPTION = "-- Không dùng --"
@@ -546,9 +546,10 @@ class SplitWorker(QThread):
             groups = list(df.groupby(df[self.split_column].fillna("KHONG_XAC_DINH")))
             total = len(groups)
             self.log.emit(f"Tìm thấy {total} giá trị khác nhau của '{self.split_column}'.")
+            source_name = os.path.splitext(os.path.basename(self.input_path))[0]
 
             for idx, (value, sub_df) in enumerate(groups, start=1):
-                fname = sanitize_filename(str(value)) + ".xlsx"
+                fname = sanitize_filename(source_name) + "_" + sanitize_filename(str(value)) + ".xlsx"
                 fpath = os.path.join(self.output_folder, fname)
                 sub_df.to_excel(fpath, index=False)
                 self.log.emit(f"  -> Đã tạo: {fname} ({len(sub_df)} dòng)")
@@ -1094,8 +1095,11 @@ class LookupPage(QWidget):
 
         layout.addWidget(page_title("Tra cứu dữ liệu XML1 từ CSDL SQLite"))
 
+        source_columns = QSplitter(Qt.Orientation.Horizontal)
+        source_columns.setChildrenCollapsible(False)
         db_group = QGroupBox("1. Cơ sở dữ liệu SQLite nguồn")
         db_form = QFormLayout()
+        db_form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.db_path_edit = QLineEdit()
         db_browse_btn = QPushButton("Chọn file .sqlite/.db...")
@@ -1109,7 +1113,7 @@ class LookupPage(QWidget):
         db_form.addRow("Bảng dữ liệu:", self.table_combo)
 
         db_group.setLayout(db_form)
-        layout.addWidget(db_group)
+        source_columns.addWidget(db_group)
 
         in_group = QGroupBox("2. File dữ liệu đầu vào (chứa cột XML1_ID)")
         in_form = QFormLayout()
@@ -1139,7 +1143,26 @@ class LookupPage(QWidget):
         in_form.addRow("Cột Công văn (nếu có):", self.col_cong_van_combo)
 
         in_group.setLayout(in_form)
-        layout.addWidget(in_group)
+        source_columns.addWidget(in_group)
+        source_columns.setStretchFactor(0, 1)
+        source_columns.setStretchFactor(1, 1)
+        source_columns.setSizes([600, 600])
+        layout.addWidget(source_columns)
+
+        template_group = QGroupBox("3. Chọn mẫu kết quả tra cứu")
+        template_row = QHBoxLayout(template_group)
+        self.chot2_radio = QRadioButton("Chốt 2")
+        self.chot3_radio = QRadioButton("Chốt 3")
+        self.template_buttons = QButtonGroup(self)
+        self.template_buttons.addButton(self.chot2_radio)
+        self.template_buttons.addButton(self.chot3_radio)
+        self.chot3_radio.setChecked(True)
+        template_row.addWidget(self.chot2_radio)
+        template_row.addWidget(self.chot3_radio)
+        self.template_info = QLabel()
+        template_row.addWidget(self.template_info)
+        template_row.addStretch()
+        layout.addWidget(template_group)
 
         action_row = QHBoxLayout()
         self.run_btn = QPushButton("Thực hiện tra cứu")
@@ -1149,8 +1172,6 @@ class LookupPage(QWidget):
         self.export_btn.clicked.connect(self.export_result)
         self.export_btn.setEnabled(False)
         action_row.addWidget(self.run_btn)
-        self.chot2_checkbox = QCheckBox("Xuất theo mẫu Chốt 2 (bỏ chọn: Chốt 3)")
-        action_row.addWidget(self.chot2_checkbox)
         action_row.addWidget(self.export_btn)
         layout.addLayout(action_row)
 
@@ -1161,11 +1182,23 @@ class LookupPage(QWidget):
         self.table_preview.setColumnCount(len(OUTPUT_COLUMNS))
         self.table_preview.setHorizontalHeaderLabels(OUTPUT_COLUMNS)
         layout.addWidget(self.table_preview, stretch=3)
+        self.chot2_radio.toggled.connect(self.refresh_template_preview)
+        self.refresh_template_preview()
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(130)
         layout.addWidget(self.log_box, stretch=1)
+
+    def selected_template_columns(self):
+        return CHOT2_COLUMNS if self.chot2_radio.isChecked() else OUTPUT_COLUMNS
+
+    def refresh_template_preview(self, checked=False):
+        columns = self.selected_template_columns()
+        name = "Chốt 2" if self.chot2_radio.isChecked() else "Chốt 3"
+        self.template_info.setText(f"{name}: {len(columns)} cột — bảng xem trước và Excel dùng cùng mẫu")
+        df = self.result_df if self.result_df is not None else pd.DataFrame(columns=columns)
+        fill_table_widget(self.table_preview, df, columns, max_rows=500)
 
     def append_log(self, text):
         self.log_box.append(text)
@@ -1284,7 +1317,7 @@ class LookupPage(QWidget):
         self.result_df = df
         self.run_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
-        fill_table_widget(self.table_preview, df, OUTPUT_COLUMNS, max_rows=500)
+        self.refresh_template_preview()
         if len(df) > 500:
             self.append_log(f"(Chỉ hiển thị 500/{len(df)} dòng trong bảng xem trước.)")
         QMessageBox.information(self, "Hoàn tất", f"Tra cứu xong: {len(df)} dòng kết quả.")
@@ -1303,7 +1336,7 @@ class LookupPage(QWidget):
         if not path:
             return
         try:
-            export_columns = CHOT2_COLUMNS if self.chot2_checkbox.isChecked() else OUTPUT_COLUMNS
+            export_columns = self.selected_template_columns()
             export_df = self.result_df.reindex(columns=export_columns, fill_value="")
             export_df.to_excel(path, index=False)
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
@@ -1702,9 +1735,11 @@ def quote_sql_identifier(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def prepare_topic_source(conn, period_column, period):
-    """Lọc tháng trước khi chạy SQL, kể cả SQL có JOIN, CTE hoặc GROUP BY."""
+def prepare_topic_source(conn, period_column, period, period_end=None):
+    """Lọc khoảng kỳ trước khi chạy SQL, kể cả JOIN, CTE hoặc GROUP BY."""
+    period_end = period if period_end is None else period_end
     literal = conn.execute("SELECT quote(?)", (period,)).fetchone()[0]
+    end_literal = conn.execute("SELECT quote(?)", (period_end,)).fetchone()[0]
     tables = conn.execute("SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
     filtered = 0
     filtered_tables = set()
@@ -1715,7 +1750,7 @@ def prepare_topic_source(conn, period_column, period):
         if match:
             conn.execute(
                 f'CREATE TEMP VIEW {table} AS SELECT * FROM main.{table} '
-                f'WHERE CAST({quote_sql_identifier(match)} AS TEXT) = {literal}'
+                f'WHERE CAST({quote_sql_identifier(match)} AS TEXT) BETWEEN {literal} AND {end_literal}'
             )
             filtered += 1
             filtered_tables.add(name.casefold())
@@ -1746,12 +1781,13 @@ class TopicRunWorker(QThread):
     finished_ok = pyqtSignal(object)  # dict {sheet_name: DataFrame}
     failed = pyqtSignal(str)
 
-    def __init__(self, src_db_path, src_table_name, col_ky_qt, ky_qt_value, topic_rows):
+    def __init__(self, src_db_path, src_table_name, col_ky_qt, ky_qt_value, topic_rows, ky_qt_end=None):
         super().__init__()
         self.src_db_path = src_db_path
         self.src_table_name = src_table_name
         self.col_ky_qt = col_ky_qt
         self.ky_qt_value = ky_qt_value
+        self.ky_qt_end = ky_qt_value if ky_qt_end is None else ky_qt_end
         self.topic_rows = topic_rows  # list các dict định nghĩa chuyên đề đã chọn
 
     def run(self):
@@ -1762,7 +1798,7 @@ class TopicRunWorker(QThread):
 
             from pathlib import Path
             conn = sqlite3.connect(Path(self.src_db_path).resolve().as_uri() + '?mode=ro', uri=True)
-            prepare_topic_source(conn, self.col_ky_qt, self.ky_qt_value)
+            prepare_topic_source(conn, self.col_ky_qt, self.ky_qt_value, self.ky_qt_end)
             results = {}
             used_sheets = set()
             total = len(self.topic_rows)
@@ -1777,9 +1813,18 @@ class TopicRunWorker(QThread):
 
                 sheet_name = sanitize_sheet_name(sheet_name, used_sheets)
                 sql = build_topic_sql(topic, self.src_table_name)
-                self.log.emit(f"[{ma_cd}] Đang chạy: {sql}  (kỳ = {self.ky_qt_value})")
+                if self.ky_qt_value != self.ky_qt_end and re.search(r':KY_QT\b', sql, re.I):
+                    raise ValueError(
+                        f"Chuyên đề '{ma_cd}' đang dùng :KY_QT cho một tháng. "
+                        "Hãy sửa điều kiện thành KY_QT BETWEEN :KY_QT_TU AND :KY_QT_DEN để chạy nhiều tháng."
+                    )
+                self.log.emit(f"[{ma_cd}] Đang chạy: {sql}  (kỳ từ {self.ky_qt_value} đến {self.ky_qt_end})")
                 try:
-                    df = pd.read_sql_query(sql, conn, params={"KY_QT": self.ky_qt_value})
+                    df = pd.read_sql_query(sql, conn, params={
+                        "KY_QT": self.ky_qt_value,
+                        "KY_QT_TU": self.ky_qt_value,
+                        "KY_QT_DEN": self.ky_qt_end,
+                    })
                 except Exception as e:
                     raise ValueError(f"Lỗi khi chạy chuyên đề '{ma_cd}': {e}") from e
 
@@ -2232,7 +2277,8 @@ class TopicManagePage(QWidget):
             "Nhập mã, tên, ghi chú và dán câu SQL SELECT hoặc WITH vào ô bên dưới. "
             "Có thể xuống dòng bằng Enter. Khi chạy, phần mềm lọc tháng trên các bảng "
             "có cột KY_QT trước khi thực hiện SQL. Dùng tên bảng thông thường (ví dụ XML1), "
-            "không thêm tiền tố main. Có thể dùng :KY_QT làm tham số tháng trong SQL."
+            "không thêm tiền tố main. Dùng KY_QT BETWEEN :KY_QT_TU AND :KY_QT_DEN "
+            "để lọc khoảng kỳ trong SQL."
         )
         note.setWordWrap(True)
         note.setObjectName("noteLabel")
@@ -2269,15 +2315,6 @@ class TopicManagePage(QWidget):
         self.save_def_btn.setObjectName("primaryBtn")
         self.save_def_btn.clicked.connect(self.run_save_def)
         form_column.addWidget(self.save_def_btn)
-
-        db_info = QLabel(
-            f"📁 Chuyên đề được lưu vào bảng DINH_NGHIA_CHUYEN_DE trong CSDL DÙNG CHUNG "
-            f"của toàn phần mềm: {DB_PATH}\n"
-            "Lưu trùng Mã chuyên đề sẽ tự động CẬP NHẬT thay vì tạo bản ghi trùng."
-        )
-        db_info.setWordWrap(True)
-        db_info.setObjectName("noteLabel")
-        form_column.addWidget(db_info)
 
         # --- Nhóm 2: Danh sách chuyên đề hiện có ---
         list_group = QGroupBox("2. Danh sách chuyên đề hiện có")
@@ -2427,7 +2464,7 @@ class TopicRunPage(QWidget):
 
         layout.addWidget(page_title("Chạy chuyên đề theo kỳ"))
         note = QLabel(
-            "Chọn mã chuyên đề và tháng, rồi bấm Chạy để lấy dữ liệu theo SQL đã lưu. "
+            "Tích chọn các chuyên đề hoặc Chọn tất cả và khoảng kỳ (YYYYMM), rồi bấm Chạy. "
             "Cấu hình CSDL nguồn ở lần đầu; ứng dụng sẽ nhớ cho lần sau. "
             "SQL chỉ truy vấn dữ liệu, kết quả có thể xem bên dưới và xuất Excel."
         )
@@ -2462,43 +2499,49 @@ class TopicRunPage(QWidget):
 
         self.ky_qt_value_combo = QComboBox()
         self.ky_qt_value_combo.setEditable(True)
+        self.ky_qt_end_combo = QComboBox()
+        self.ky_qt_end_combo.setEditable(True)
 
         src_group.setLayout(src_form)
         columns.addWidget(src_group)
 
         # --- Nhóm 2: Chọn chuyên đề ---
         topic_group = QGroupBox("2. Chọn chuyên đề cần chạy")
-        topic_layout = QVBoxLayout()
-        topic_btn_row = QHBoxLayout()
+        topic_layout = QVBoxLayout(topic_group)
         self.refresh_topic_list_btn = QPushButton("Tải lại danh sách chuyên đề")
         self.refresh_topic_list_btn.clicked.connect(self.refresh_topic_list)
-        topic_btn_row.addWidget(self.refresh_topic_list_btn)
-        topic_layout.addLayout(topic_btn_row)
-
-        self.topic_combo = QComboBox()
-        self.topic_combo.setMinimumWidth(320)
-        choose_form = QFormLayout()
-        choose_form.addRow("Mã chuyên đề:", self.topic_combo)
-        choose_form.addRow("Tháng (KY_QT):", self.ky_qt_value_combo)
-        topic_layout.addLayout(choose_form)
-        topic_group.setLayout(topic_layout)
+        topic_layout.addWidget(self.refresh_topic_list_btn)
+        self.select_all_topics = QCheckBox("Chọn tất cả")
+        self.select_all_topics.clicked.connect(self.set_all_topics_checked)
+        topic_layout.addWidget(self.select_all_topics)
+        self.topic_list = QListWidget()
+        self.topic_list.setMinimumHeight(150)
+        self.topic_list.itemChanged.connect(self.update_topic_selection)
+        topic_layout.addWidget(self.topic_list, 1)
+        self.topic_selection_label = QLabel("Đã chọn 0/0 chuyên đề")
+        topic_layout.addWidget(self.topic_selection_label)
         columns.addWidget(topic_group)
-        columns.setStretchFactor(0, 1)
-        columns.setStretchFactor(1, 1)
-        columns.setSizes([600, 600])
-        layout.addWidget(columns)
 
-        btn_row = QHBoxLayout()
-        self.run_btn = QPushButton("Chạy")
+        run_group = QGroupBox("3. Kỳ chạy và xuất kết quả")
+        run_layout = QVBoxLayout(run_group)
+        choose_form = QFormLayout()
+        choose_form.addRow("Từ kỳ (YYYYMM):", self.ky_qt_value_combo)
+        choose_form.addRow("Đến kỳ (YYYYMM):", self.ky_qt_end_combo)
+        run_layout.addLayout(choose_form)
+        run_layout.addStretch()
+        self.run_btn = QPushButton("Chạy các chuyên đề đã chọn")
         self.run_btn.setObjectName("primaryBtn")
         self.run_btn.clicked.connect(self.run_topics)
         self.export_btn = QPushButton("Xuất kết quả ra Excel")
         self.export_btn.clicked.connect(self.export_results)
         self.export_btn.setEnabled(False)
-        btn_row.addWidget(self.run_btn)
-        btn_row.addWidget(self.export_btn)
-        topic_layout.addStretch()
-        topic_layout.addLayout(btn_row)
+        run_layout.addWidget(self.run_btn)
+        run_layout.addWidget(self.export_btn)
+        columns.addWidget(run_group)
+        for index in range(3):
+            columns.setStretchFactor(index, 1)
+        columns.setSizes([400, 450, 350])
+        layout.addWidget(columns)
 
         self.result_table = QTableWidget()
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -2566,6 +2609,7 @@ class TopicRunPage(QWidget):
 
             ky_col = self.col_ky_qt_combo.currentText().strip()
             self.ky_qt_value_combo.clear()
+            self.ky_qt_end_combo.clear()
             if ky_col:
                 try:
                     vals_df = pd.read_sql_query(
@@ -2573,6 +2617,7 @@ class TopicRunPage(QWidget):
                     )
                     vals = [str(v) for v in vals_df["v"].dropna().tolist()]
                     self.ky_qt_value_combo.addItems(vals)
+                    self.ky_qt_end_combo.addItems(vals)
                 except Exception:
                     pass
             conn.close()
@@ -2593,16 +2638,49 @@ class TopicRunPage(QWidget):
             df = pd.read_sql_query("SELECT * FROM DINH_NGHIA_CHUYEN_DE ORDER BY MA_CHUYEN_DE", conn)
             conn.close()
             self.topic_defs_df = df
-            previous = self.topic_combo.currentData()
-            self.topic_combo.clear()
-            for _, row in df.iterrows():
-                self.topic_combo.addItem(f"{row['MA_CHUYEN_DE']} — {row['TEN_CHUYEN_DE']}", row["MA_CHUYEN_DE"])
-            index = self.topic_combo.findData(previous)
-            if index >= 0:
-                self.topic_combo.setCurrentIndex(index)
+            previous = set(self.checked_topic_codes())
+            self.topic_list.blockSignals(True)
+            try:
+                self.topic_list.clear()
+                for _, row in df.iterrows():
+                    code = row["MA_CHUYEN_DE"]
+                    item = QListWidgetItem(f"{code} — {row['TEN_CHUYEN_DE']}")
+                    item.setData(Qt.ItemDataRole.UserRole, code)
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Checked if code in previous else Qt.CheckState.Unchecked)
+                    item.setToolTip(item.text())
+                    self.topic_list.addItem(item)
+            finally:
+                self.topic_list.blockSignals(False)
+            self.update_topic_selection()
             self.append_log(f"Đã tải {len(df)} chuyên đề khả dụng.")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách chuyên đề:\n{e}")
+
+    def checked_topic_codes(self):
+        return [self.topic_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.topic_list.count())
+                if self.topic_list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def set_all_topics_checked(self, checked):
+        self.topic_list.blockSignals(True)
+        try:
+            for i in range(self.topic_list.count()):
+                self.topic_list.item(i).setCheckState(
+                    Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        finally:
+            self.topic_list.blockSignals(False)
+        self.update_topic_selection()
+
+    def update_topic_selection(self, *_):
+        total = self.topic_list.count()
+        selected = len(self.checked_topic_codes())
+        self.select_all_topics.setTristate(0 < selected < total)
+        self.select_all_topics.setCheckState(
+            Qt.CheckState.Unchecked if selected == 0 else
+            Qt.CheckState.Checked if selected == total else Qt.CheckState.PartiallyChecked)
+        self.select_all_topics.setEnabled(total > 0)
+        self.topic_selection_label.setText(f"Đã chọn {selected}/{total} chuyên đề")
 
     def run_topics(self):
         db_path = self.src_db_path_edit.text().strip()
@@ -2615,15 +2693,23 @@ class TopicRunPage(QWidget):
             return
         col_ky_qt = self.col_ky_qt_combo.currentText().strip()
         ky_qt_value = self.ky_qt_value_combo.currentText().strip()
-        if not col_ky_qt or not ky_qt_value:
-            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn cột KY_QT và kỳ cần chạy.")
+        ky_qt_end = self.ky_qt_end_combo.currentText().strip()
+        if not col_ky_qt or not ky_qt_value or not ky_qt_end:
+            QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn cột KY_QT, kỳ bắt đầu và kỳ kết thúc.")
+            return
+        if any(not re.fullmatch(r'[0-9]{4}(0[1-9]|1[0-2])', value)
+               for value in (ky_qt_value, ky_qt_end)):
+            QMessageBox.warning(self, "Kỳ không hợp lệ", "Nhập kỳ theo dạng YYYYMM, ví dụ 202601.")
+            return
+        if ky_qt_value > ky_qt_end:
+            QMessageBox.warning(self, "Khoảng kỳ không hợp lệ", "Kỳ bắt đầu phải nhỏ hơn hoặc bằng kỳ kết thúc.")
             return
 
-        code = self.topic_combo.currentData()
-        if not code or self.topic_defs_df is None:
+        codes = self.checked_topic_codes()
+        if not codes or self.topic_defs_df is None:
             QMessageBox.warning(self, "Chưa chọn chuyên đề", "Vui lòng chọn ít nhất 1 chuyên đề.")
             return
-        topic_rows = self.topic_defs_df[self.topic_defs_df["MA_CHUYEN_DE"] == code].to_dict("records")
+        topic_rows = self.topic_defs_df[self.topic_defs_df["MA_CHUYEN_DE"].isin(codes)].to_dict("records")
 
         self.run_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
@@ -2633,7 +2719,7 @@ class TopicRunPage(QWidget):
         self.result_table.clear()
         self.result_table.setRowCount(0)
 
-        self.run_worker = TopicRunWorker(db_path, table, col_ky_qt, ky_qt_value, topic_rows)
+        self.run_worker = TopicRunWorker(db_path, table, col_ky_qt, ky_qt_value, topic_rows, ky_qt_end)
         self.run_worker.log.connect(self.append_log)
         self.run_worker.progress.connect(self.progress.setValue)
         self.run_worker.finished_ok.connect(self.on_run_done)

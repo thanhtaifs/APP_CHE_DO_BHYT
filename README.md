@@ -81,7 +81,10 @@ MA_CHUYEN_DE, CONG_VAN
   không có trong CSDL nguồn nên luôn để **trống**, bạn tự nhập tay sau.
 - Hai cột **MA_CHUYEN_DE, CONG_VAN** lấy **trực tiếp từ file đầu vào** của bạn
   (không tra cứu CSDL).
-- Checkbox **Xuất theo mẫu Chốt 2**: chọn để xuất theo bộ cột Chốt 2
+- Nhóm **Chọn mẫu kết quả tra cứu** có hai lựa chọn **Chốt 2 / Chốt 3**.
+  Bảng xem trước cập nhật ngay tên, thứ tự cột và dữ liệu theo mẫu đang chọn;
+  Excel xuất cùng bộ cột với bảng. Mặc định chọn Chốt 3.
+  Chọn **Chốt 2** để xem và xuất theo bộ cột Chốt 2
   (`XML1_ID, MA_BN, HO_TEN, MA_THE, MA_BENH, MA_BENH_KHAC, NGAY_VAO, NGAY_RA,
   LOAI_CP, ID_CP, MA_CP, TEN_CP, SO_DANG_KY, SO_LUONG_DN, DON_GIA_DN,
   TYLE_TT_DN, MUC_HUONG_DN, SL_DC, DON_GIA_DC, TYLE_TT_DC, MUC_HUONG_DC,
@@ -107,7 +110,7 @@ Phần mềm tự quy đổi **Loại hồ sơ** (Ngoại trú/Nội trú) từ 
 
 | Mã   | Loại hồ sơ  |
 |------|-------------|
-| 1, 2 | Ngoại trú   |
+| 1, 2, 7 | Ngoại trú   |
 | 3, 9 | Nội trú     |
 
 ### Cách dùng
