@@ -1,10 +1,8 @@
 # Phần mềm nghiệp vụ BHYT - Giám định XML1
 
-Giao diện dạng **menu hiện đại (sidebar)** bên trái, nội dung từng chức năng hiển
-thị bên phải, được thiết kế theo **Modern Enterprise Design System** (dùng skill
-`pyqt6-ui-designer`): nền sáng, sidebar màu xám-xanh nhạt với thanh chỉ báo mục
-đang chọn bên trái, thẻ nội dung (card) bo góc, màu chủ đạo xanh dương đậm
-**#003d9b**. Gồm 8 chức năng:
+Giao diện **ribbon** phía trên, có icon và tên chức năng, chia thành 3 tab:
+**Nghiệp vụ BHYT**, **Chuyên đề**, **Công cụ Excel**. Nội dung chức năng
+hiển thị bên dưới; nút đang chọn được tô xanh. Gồm 8 chức năng:
 
 1. 🔎 Tra cứu dữ liệu XML1 từ CSDL SQLite
 2. 🗂 Tách file Excel theo MA_CSKCB
@@ -17,12 +15,29 @@ thị bên phải, được thiết kế theo **Modern Enterprise Design System*
 
 ## 1. Cài đặt
 
+### Cách dùng chuyên đề SQL
+
+- **Định nghĩa chuyên đề:** nhập mã, tên, ghi chú và dán SQL vào ô nhiều dòng.
+  Bấm Enter để xuống dòng; chọn một dòng trong danh sách để sửa và lưu lại.
+- Hỗ trợ câu `SELECT`, `WITH` đầy đủ và điều kiện WHERE của chuyên đề cũ.
+  Dùng tên bảng như `XML1`, không thêm tiền tố `main.`. Khi chạy, ứng dụng
+  lọc tháng trước trên các bảng có cột `KY_QT`, rồi mới thực hiện SQL.
+  Có thể dùng tham số `:KY_QT` trong câu lệnh. Bảng danh mục không có cột
+  tháng vẫn được giữ nguyên để JOIN.
+- **Chạy chuyên đề:** cấu hình CSDL nguồn lần đầu; ứng dụng nhớ file và bảng
+  cho lần sau. Chọn mã chuyên đề, tháng theo giá trị KY_QT trong CSDL (ví dụ
+  `202601`), rồi bấm Chạy. Xem trước tối đa 1.000 dòng, xuất Excel lấy đủ kết quả.
+- Nguồn được mở ở chế độ chỉ đọc. Tháng đã ghi cố định trong SQL cần được
+  bỏ hoặc đổi thành `:KY_QT` để dùng theo tháng đang chọn.
+- Cột ghi chú được bổ sung tự động khi mở ứng dụng; giữ lại các định nghĩa cũ.
+
 ```
 pip install -r requirements.txt
 ```
 
-Giữ 3 file sau **cùng 1 thư mục**: `app_tra_cuu_xml1.py`, `requirements.txt`,
-và `DB.sqlite` (CSDL dùng chung, đã tạo sẵn 2 bảng rỗng — xem mục 4, 5). Nếu
+Giữ `app_tra_cuu_xml1.py`, `ribbon_ui.py` và `danh_muc_ui.py` **cùng 1 thư mục**.
+Cài thư viện bằng `pip install PyQt6 pandas openpyxl` nếu không có `requirements.txt`.
+`DB.sqlite` là CSDL dùng chung (đã tạo sẵn 2 bảng rỗng — xem mục 4, 5). Nếu
 thiếu file `DB.sqlite`, phần mềm sẽ tự tạo lại khi dùng lần đầu, nên không bắt
 buộc phải có sẵn.
 
@@ -31,6 +46,21 @@ Chạy chương trình:
 ```
 python app_tra_cuu_xml1.py
 ```
+
+`ribbon_ui.py` quản lý cửa sổ chính, các tab, nhóm nút và icon ribbon.
+Chỉnh `RIBBON_TABS` để đổi tên, icon hoặc nhóm chức năng.
+`app_tra_cuu_xml1.py` giữ các trang và xử lý nghiệp vụ; lớp `MainWindow`
+truyền các lớp trang vào giao diện ribbon theo thứ tự `page_index`.
+
+Tab **Danh mục** trên ribbon có hai chức năng quản lý CSDL dùng chung:
+
+- **Loại KCB:** bảng `DM_LOAI_KCB`, các cột `MA_LOAI_KCB`, `TEN_LOAI_KCB`, `GHI_CHU`.
+- **Cơ sở KCB:** bảng `DM_CSKCB`, các cột `MA_CSKCB`, `TEN_CSKCB`, `GHI_CHU`.
+
+Các bảng được tạo rỗng tự động khi mở ứng dụng. Nhập mã và tên rồi bấm Lưu;
+chọn một dòng để sửa tên/ghi chú, bấm Thêm mới để nhập mã khác.
+Hỗ trợ tìm theo mã, tên, ghi chú và xóa có xác nhận. Mã là chuỗi, giữ số 0 đầu
+và không cho phép trùng mã. Giao diện và thao tác CSDL nằm trong `danh_muc_ui.py`.
 
 ---
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 PHẦN MỀM NGHIỆP VỤ BHYT - GIÁM ĐỊNH XML1
-Giao diện menu hiện đại (sidebar) gồm các chức năng:
+Giao diện ribbon (quản lý tại ribbon_ui.py) gồm các chức năng:
     1. Tra cứu dữ liệu XML1 từ CSDL SQLite
     2. Tách file Excel theo MA_CSKCB
     3. Tổng hợp trừ chi phí theo MA_CSKCB & Mã chuyên đề
@@ -27,14 +27,17 @@ import unicodedata
 
 import pandas as pd
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
+from ribbon_ui import RibbonMainWindow
+from danh_muc_ui import CatalogPage
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QSettings
 from PyQt6.QtGui import QDesktopServices, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QFileDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QProgressBar, QMessageBox, QGroupBox,
-    QCheckBox, QFrame, QAbstractItemView
+    QCheckBox, QFrame, QAbstractItemView, QSplitter
 )
 
 NONE_OPTION = "-- Không dùng --"
@@ -303,7 +306,7 @@ def ascii_slug(text: str) -> str:
 
 
 def classify_loai_ho_so(code) -> str:
-    """Quy đổi mã loại KCB -> loại hồ sơ: 1,2 = Ngoại trú; 3,9 = Nội trú."""
+    """Quy đổi mã loại KCB -> loại hồ sơ: 1,2,7 = Ngoại trú; 3,9 = Nội trú."""
     if code is None:
         return ""
     s = str(code).strip()
@@ -314,7 +317,7 @@ def classify_loai_ho_so(code) -> str:
         s_norm = str(n)
     except (ValueError, TypeError):
         s_norm = s
-    if s_norm in ("1", "2"):
+    if s_norm in ("1", "2", "7"):
         return "Ngoại trú"
     if s_norm in ("3", "9"):
         return "Nội trú"
@@ -323,7 +326,7 @@ def classify_loai_ho_so(code) -> str:
 
 TOPIC_DEF_COLUMNS = [
     "MA_CHUYEN_DE", "TEN_CHUYEN_DE", "TEN_SHEET",
-    "DANH_SACH_COT", "NOI_DUNG_CANH_BAO", "DIEU_KIEN_SQL",
+    "DANH_SACH_COT", "NOI_DUNG_CANH_BAO", "DIEU_KIEN_SQL", "GHI_CHU",
 ]
 
 
@@ -344,6 +347,9 @@ def ensure_topic_defs_table(conn):
             DIEU_KIEN_SQL TEXT
         )
     """)
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(DINH_NGHIA_CHUYEN_DE)')}
+    if "GHI_CHU" not in columns:
+        conn.execute("ALTER TABLE DINH_NGHIA_CHUYEN_DE ADD COLUMN GHI_CHU TEXT DEFAULT ''")
     conn.commit()
 
 
@@ -352,8 +358,8 @@ def upsert_topic_def(conn, row: dict):
     ensure_topic_defs_table(conn)
     conn.execute(
         "INSERT OR REPLACE INTO DINH_NGHIA_CHUYEN_DE "
-        "(MA_CHUYEN_DE, TEN_CHUYEN_DE, TEN_SHEET, DANH_SACH_COT, NOI_DUNG_CANH_BAO, DIEU_KIEN_SQL) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(MA_CHUYEN_DE, TEN_CHUYEN_DE, TEN_SHEET, DANH_SACH_COT, NOI_DUNG_CANH_BAO, DIEU_KIEN_SQL, GHI_CHU) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         tuple(row.get(c, "") for c in TOPIC_DEF_COLUMNS)
     )
     conn.commit()
@@ -1491,7 +1497,7 @@ class ExcludeSummaryPage(QWidget):
         loai_row.addWidget(self.col_loai_kcb_combo)
         self.loai_is_text_check = QCheckBox("Cột này đã ghi sẵn chữ Ngoại trú/Nội trú (không cần quy đổi mã)")
         loai_row.addWidget(self.loai_is_text_check)
-        in_form.addRow("Cột mã loại KCB\n(1,2=Ngoại trú; 3,9=Nội trú):", loai_row)
+        in_form.addRow("Cột mã loại KCB\n(1,2,7=Ngoại trú; 3,9=Nội trú):", loai_row)
 
         self.col_tbhtt_combo = QComboBox()
         in_form.addRow("Cột T_BHTT (số tiền để trừ):", self.col_tbhtt_combo)
@@ -1661,7 +1667,7 @@ class ExcludeSummaryPage(QWidget):
             self, "Hoàn tất",
             "Đã tính xong tổng hợp trừ chi phí.\n\n"
             "Mẹo: để lưu các hồ sơ đã trừ vào CSDL và kiểm tra trùng với các lần "
-            "trước, dùng chức năng '💾 Lưu hồ sơ đã trừ & Kiểm tra trùng' ở menu bên trái "
+            "trước, dùng chức năng 'Lưu hồ sơ / Kiểm tra trùng' trên ribbon "
             "(tải trực tiếp file Excel bạn vừa xuất, ví dụ sheet Chi_Tiet)."
         )
 
@@ -1692,6 +1698,48 @@ class ExcludeSummaryPage(QWidget):
 # WORKER: CHẠY CHUYÊN ĐỀ THEO KỲ (KY_QT) TRÊN CSDL SQLITE NGOÀI
 # ============================================================
 
+def quote_sql_identifier(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def prepare_topic_source(conn, period_column, period):
+    """Lọc tháng trước khi chạy SQL, kể cả SQL có JOIN, CTE hoặc GROUP BY."""
+    literal = conn.execute("SELECT quote(?)", (period,)).fetchone()[0]
+    tables = conn.execute("SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+    filtered = 0
+    filtered_tables = set()
+    for (name,) in tables:
+        table = quote_sql_identifier(name)
+        columns = [r[1] for r in conn.execute(f'PRAGMA main.table_info({table})')]
+        match = next((c for c in columns if c.casefold() == period_column.casefold()), None)
+        if match:
+            conn.execute(
+                f'CREATE TEMP VIEW {table} AS SELECT * FROM main.{table} '
+                f'WHERE CAST({quote_sql_identifier(match)} AS TEXT) = {literal}'
+            )
+            filtered += 1
+            filtered_tables.add(name.casefold())
+    if not filtered:
+        raise ValueError(f"Không tìm thấy cột tháng '{period_column}' trong CSDL nguồn.")
+    conn.execute("PRAGMA query_only = ON")
+    def authorize(action, arg1, arg2, database, origin):
+        # Chặn đọc trực tiếp main.XML1 để không bỏ qua bộ lọc tháng của view.
+        if action == sqlite3.SQLITE_READ and database == "main" and origin is None and arg1.casefold() in filtered_tables:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    conn.set_authorizer(authorize)
+
+
+def build_topic_sql(topic, table):
+    sql = (topic.get("DIEU_KIEN_SQL") or "").strip()
+    prefix = re.sub(r'\A(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*', '', sql, flags=re.S)
+    if re.match(r'(?i)^(SELECT|WITH)\b', prefix):
+        # Không bọc truy vấn để giữ đúng thứ tự, nhóm và các cột SQL tự chọn.
+        return sql
+    columns = (topic.get("DANH_SACH_COT") or "").strip() or "*"
+    return f'SELECT {columns} FROM {quote_sql_identifier(table)} WHERE ({sql})'
+
+
 class TopicRunWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int)
@@ -1707,12 +1755,16 @@ class TopicRunWorker(QThread):
         self.topic_rows = topic_rows  # list các dict định nghĩa chuyên đề đã chọn
 
     def run(self):
+        conn = None
         try:
             if not self.topic_rows:
                 raise ValueError("Vui lòng chọn ít nhất 1 chuyên đề để chạy.")
 
-            conn = sqlite3.connect(self.src_db_path)
+            from pathlib import Path
+            conn = sqlite3.connect(Path(self.src_db_path).resolve().as_uri() + '?mode=ro', uri=True)
+            prepare_topic_source(conn, self.col_ky_qt, self.ky_qt_value)
             results = {}
+            used_sheets = set()
             total = len(self.topic_rows)
 
             for i, topic in enumerate(self.topic_rows, start=1):
@@ -1723,13 +1775,11 @@ class TopicRunWorker(QThread):
                 sheet_name = (topic.get("TEN_SHEET") or "").strip() or ma_cd
                 sheet_name = re.sub(r'[\\/*?:\[\]]', "_", sheet_name)[:31] or ma_cd[:31]
 
-                sql = (
-                    f'SELECT {select_cols} FROM "{self.src_table_name}" '
-                    f'WHERE "{self.col_ky_qt}" = ? AND ({dieu_kien})'
-                )
+                sheet_name = sanitize_sheet_name(sheet_name, used_sheets)
+                sql = build_topic_sql(topic, self.src_table_name)
                 self.log.emit(f"[{ma_cd}] Đang chạy: {sql}  (kỳ = {self.ky_qt_value})")
                 try:
-                    df = pd.read_sql_query(sql, conn, params=[self.ky_qt_value])
+                    df = pd.read_sql_query(sql, conn, params={"KY_QT": self.ky_qt_value})
                 except Exception as e:
                     raise ValueError(f"Lỗi khi chạy chuyên đề '{ma_cd}': {e}") from e
 
@@ -1741,13 +1791,15 @@ class TopicRunWorker(QThread):
                 self.log.emit(f"[{ma_cd}] -> {len(df)} dòng, sheet '{sheet_name}'.")
                 self.progress.emit(int(i / total * 100))
 
-            conn.close()
             self.finished_ok.emit(results)
 
         except Exception as e:
             self.log.emit("LỖI: " + str(e))
             self.log.emit(traceback.format_exc())
             self.failed.emit(str(e))
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 # ============================================================
@@ -1782,7 +1834,7 @@ class SaveDeductedPage(QWidget):
         layout.addWidget(note)
 
         # --- Nhóm 1: File & khai báo cột ---
-        in_group = QGroupBox("1. File Excel hồ sơ đã trừ & khai báo cột")
+        in_group = QGroupBox("File Excel hồ sơ đã trừ & khai báo cột")
         in_form = QFormLayout()
 
         self.input_path_edit = QLineEdit()
@@ -1826,22 +1878,6 @@ class SaveDeductedPage(QWidget):
 
         in_group.setLayout(in_form)
         layout.addWidget(in_group)
-
-        # --- Nhóm 2: CSDL lưu trữ (đường dẫn cố định, gắn kèm dự án) ---
-        db_group = QGroupBox("2. CSDL lưu trữ (dùng chung 1 file DB.sqlite)")
-        db_layout = QVBoxLayout()
-        db_info = QLabel(
-            f"📁 Dữ liệu được lưu vào bảng HO_SO_DA_TRU trong CSDL DÙNG CHUNG của "
-            f"toàn phần mềm (gắn cố định kèm theo phần mềm, không cần chọn đường dẫn "
-            f"mỗi lần dùng):\n{DB_PATH}"
-        )
-        db_info.setWordWrap(True)
-        db_layout.addWidget(db_info)
-        open_folder_btn = QPushButton("Mở thư mục chứa CSDL")
-        open_folder_btn.clicked.connect(self.open_db_folder)
-        db_layout.addWidget(open_folder_btn)
-        db_group.setLayout(db_layout)
-        layout.addWidget(db_group)
 
         # --- Nút hành động ---
         btn_row = QHBoxLayout()
@@ -2179,6 +2215,7 @@ class SaveDeductedPage(QWidget):
 # ============================================================
 
 class TopicManagePage(QWidget):
+    definitionsChanged = pyqtSignal()
     def __init__(self):
         super().__init__()
         self.topics_table_df = None
@@ -2190,49 +2227,48 @@ class TopicManagePage(QWidget):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
-        layout.addWidget(page_title("Định nghĩa chuyên đề (điều kiện SQL)"))
+        layout.addWidget(page_title("Định nghĩa chuyên đề"))
         note = QLabel(
-            "Dùng cho các chuyên đề mà quy tắc không phải là danh sách mã bệnh, mà là 1 "
-            "điều kiện SQL tuỳ ý (so sánh số lượng, đơn giá, danh sách MA_CP...) — ví dụ: "
-            "\"SO_LUONG_BV > 2 AND MA_CP in ('05C.224.8', ...)\". Mỗi chuyên đề gồm: mã, "
-            "tên, điều kiện SQL (không cần viết KY_QT, phần mềm tự thêm khi chạy ở trang "
-            "'▶️ Chạy chuyên đề theo kỳ'), nội dung cảnh báo và tên sheet khi xuất Excel."
+            "Nhập mã, tên, ghi chú và dán câu SQL SELECT hoặc WITH vào ô bên dưới. "
+            "Có thể xuống dòng bằng Enter. Khi chạy, phần mềm lọc tháng trên các bảng "
+            "có cột KY_QT trước khi thực hiện SQL. Dùng tên bảng thông thường (ví dụ XML1), "
+            "không thêm tiền tố main. Có thể dùng :KY_QT làm tham số tháng trong SQL."
         )
         note.setWordWrap(True)
         note.setObjectName("noteLabel")
         layout.addWidget(note)
 
         # --- Nhóm 1: Thêm / cập nhật 1 chuyên đề (nhập tay) ---
+        columns = QSplitter(Qt.Orientation.Horizontal)
+        columns.setChildrenCollapsible(False)
         form_group = QGroupBox("1. Thêm / cập nhật 1 chuyên đề")
+        form_column = QVBoxLayout(form_group)
         form = QFormLayout()
+        form_column.addLayout(form)
 
         self.def_ma_cd_edit = QLineEdit()
         form.addRow("Mã chuyên đề:", self.def_ma_cd_edit)
         self.def_ten_cd_edit = QLineEdit()
         form.addRow("Tên chuyên đề:", self.def_ten_cd_edit)
-        self.def_ten_sheet_edit = QLineEdit()
-        form.addRow("Tên sheet khi xuất Excel:", self.def_ten_sheet_edit)
-        self.def_cot_edit = QLineEdit()
-        self.def_cot_edit.setPlaceholderText("Để trống = lấy tất cả cột (*)")
-        form.addRow("Danh sách cột cần lấy (tuỳ chọn):", self.def_cot_edit)
-        self.def_canh_bao_edit = QLineEdit()
-        form.addRow("Nội dung cảnh báo:", self.def_canh_bao_edit)
+        self.def_ghi_chu_edit = QLineEdit()
+        form.addRow("Ghi chú:", self.def_ghi_chu_edit)
 
         self.def_dieu_kien_edit = QTextEdit()
         self.def_dieu_kien_edit.setObjectName("sqlInputArea")
         self.def_dieu_kien_edit.setPlaceholderText(
-            'Ví dụ:\nSO_LUONG_BV > 2 AND MA_CP in ("05C.224.8","05C.224.121","HD.150")'
+            'SELECT *\nFROM XML1\nWHERE SO_LUONG_BV > 2;'
         )
-        self.def_dieu_kien_edit.setMaximumHeight(110)
-        form.addRow("Điều kiện SQL (WHERE, không kèm KY_QT):", self.def_dieu_kien_edit)
-
-        form_group.setLayout(form)
-        layout.addWidget(form_group)
+        self.def_dieu_kien_edit.setAcceptRichText(False)
+        self.def_dieu_kien_edit.setMinimumHeight(150)
+        self.def_dieu_kien_edit.setTabChangesFocus(False)
+        form_column.addWidget(QLabel("Câu lệnh SQL:"))
+        form_column.addWidget(self.def_dieu_kien_edit, 1)
+        columns.addWidget(form_group)
 
         self.save_def_btn = QPushButton("Lưu chuyên đề")
         self.save_def_btn.setObjectName("primaryBtn")
         self.save_def_btn.clicked.connect(self.run_save_def)
-        layout.addWidget(self.save_def_btn)
+        form_column.addWidget(self.save_def_btn)
 
         db_info = QLabel(
             f"📁 Chuyên đề được lưu vào bảng DINH_NGHIA_CHUYEN_DE trong CSDL DÙNG CHUNG "
@@ -2241,7 +2277,7 @@ class TopicManagePage(QWidget):
         )
         db_info.setWordWrap(True)
         db_info.setObjectName("noteLabel")
-        layout.addWidget(db_info)
+        form_column.addWidget(db_info)
 
         # --- Nhóm 2: Danh sách chuyên đề hiện có ---
         list_group = QGroupBox("2. Danh sách chuyên đề hiện có")
@@ -2258,9 +2294,15 @@ class TopicManagePage(QWidget):
         self.topics_table = QTableWidget()
         self.topics_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.topics_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.topics_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.topics_table.itemSelectionChanged.connect(self.load_selected_topic)
         list_layout.addWidget(self.topics_table)
         list_group.setLayout(list_layout)
-        layout.addWidget(list_group, stretch=2)
+        columns.addWidget(list_group)
+        columns.setStretchFactor(0, 1)
+        columns.setStretchFactor(1, 1)
+        columns.setSizes([600, 600])
+        layout.addWidget(columns, stretch=1)
 
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
@@ -2269,7 +2311,7 @@ class TopicManagePage(QWidget):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(140)
-        layout.addWidget(self.log_box, stretch=1)
+        layout.addWidget(self.log_box)
 
     def append_log(self, text):
         self.log_box.append(text)
@@ -2279,20 +2321,23 @@ class TopicManagePage(QWidget):
     def run_save_def(self):
         ma_cd = self.def_ma_cd_edit.text().strip().upper()
         dieu_kien = self.def_dieu_kien_edit.toPlainText().strip()
-        if not ma_cd or not dieu_kien:
+        if not ma_cd or not self.def_ten_cd_edit.text().strip() or not dieu_kien:
             QMessageBox.warning(
                 self, "Thiếu thông tin",
-                "Vui lòng nhập Mã chuyên đề và Điều kiện SQL."
+                "Vui lòng nhập mã chuyên đề, tên chuyên đề và câu SQL."
             )
             return
         row = {
             "MA_CHUYEN_DE": ma_cd,
             "TEN_CHUYEN_DE": self.def_ten_cd_edit.text().strip(),
-            "TEN_SHEET": self.def_ten_sheet_edit.text().strip(),
-            "DANH_SACH_COT": self.def_cot_edit.text().strip(),
-            "NOI_DUNG_CANH_BAO": self.def_canh_bao_edit.text().strip(),
+            "GHI_CHU": self.def_ghi_chu_edit.text().strip(),
             "DIEU_KIEN_SQL": dieu_kien,
         }
+        # Giữ cấu hình chuyên đề cũ khi sửa, tránh mất cột hoặc cảnh báo đã lưu.
+        if self.topics_table_df is not None:
+            existing = self.topics_table_df[self.topics_table_df["MA_CHUYEN_DE"] == ma_cd]
+            if not existing.empty:
+                row = {**existing.iloc[0].to_dict(), **row}
         try:
             conn = sqlite3.connect(DB_PATH)
             upsert_topic_def(conn, row)
@@ -2300,6 +2345,7 @@ class TopicManagePage(QWidget):
             self.append_log(f"Đã lưu chuyên đề '{ma_cd}'.")
             QMessageBox.information(self, "Thành công", f"Đã lưu chuyên đề '{ma_cd}'.")
             self.refresh_topics_table()
+            self.definitionsChanged.emit()
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không lưu được chuyên đề:\n{e}")
 
@@ -2314,10 +2360,21 @@ class TopicManagePage(QWidget):
             )
             conn.close()
             self.topics_table_df = df
-            fill_table_widget(self.topics_table, df, TOPIC_DEF_COLUMNS)
+            fill_table_widget(self.topics_table, df, ["MA_CHUYEN_DE", "TEN_CHUYEN_DE", "GHI_CHU", "DIEU_KIEN_SQL"])
+            self.topics_table.setHorizontalHeaderLabels(["Mã chuyên đề", "Tên chuyên đề", "Ghi chú", "Câu lệnh SQL"])
             self.append_log(f"Đã tải {len(df)} chuyên đề hiện có trong CSDL.")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách chuyên đề:\n{e}")
+
+    def load_selected_topic(self):
+        index = self.topics_table.currentRow()
+        if self.topics_table_df is None or not 0 <= index < len(self.topics_table_df):
+            return
+        row = self.topics_table_df.iloc[index].fillna("")
+        self.def_ma_cd_edit.setText(str(row["MA_CHUYEN_DE"]))
+        self.def_ten_cd_edit.setText(str(row["TEN_CHUYEN_DE"]))
+        self.def_ghi_chu_edit.setText(str(row["GHI_CHU"]))
+        self.def_dieu_kien_edit.setPlainText(str(row["DIEU_KIEN_SQL"]))
 
     def delete_selected_topic(self):
         row_idx = self.topics_table.currentRow()
@@ -2340,6 +2397,7 @@ class TopicManagePage(QWidget):
             conn.close()
             self.append_log(f"Đã xoá chuyên đề '{r['MA_CHUYEN_DE']}'.")
             self.refresh_topics_table()
+            self.definitionsChanged.emit()
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không xoá được:\n{e}")
 
@@ -2356,6 +2414,11 @@ class TopicRunPage(QWidget):
         self.results = None  # dict {sheet_name: df}
         self._build_ui()
         self.refresh_topic_list()
+        settings = QSettings("BHYT", "XML1")
+        saved_path = settings.value("topics/source_path", "")
+        if saved_path and os.path.isfile(saved_path):
+            self.src_db_path_edit.setText(saved_path)
+            self.load_source_tables(settings.value("topics/source_table", ""))
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -2364,17 +2427,18 @@ class TopicRunPage(QWidget):
 
         layout.addWidget(page_title("Chạy chuyên đề theo kỳ"))
         note = QLabel(
-            "Chọn CSDL nguồn, chọn 1 hoặc nhiều chuyên đề đã định nghĩa ở trang '🧩 Định "
-            "nghĩa chuyên đề', chọn kỳ quyết toán (KY_QT/tháng), rồi bấm Chạy — không cần "
-            "viết lại code cho từng chuyên đề. Kết quả xuất ra 1 file Excel nhiều sheet, "
-            "mỗi chuyên đề 1 sheet, kèm cột NOI_DUNG_CANH_BAO."
+            "Chọn mã chuyên đề và tháng, rồi bấm Chạy để lấy dữ liệu theo SQL đã lưu. "
+            "Cấu hình CSDL nguồn ở lần đầu; ứng dụng sẽ nhớ cho lần sau. "
+            "SQL chỉ truy vấn dữ liệu, kết quả có thể xem bên dưới và xuất Excel."
         )
         note.setWordWrap(True)
         note.setObjectName("noteLabel")
         layout.addWidget(note)
 
         # --- Nhóm 1: Nguồn dữ liệu ---
-        src_group = QGroupBox("1. Nguồn dữ liệu CSDL SQLite (ví dụ xml123.sqlite)")
+        columns = QSplitter(Qt.Orientation.Horizontal)
+        columns.setChildrenCollapsible(False)
+        src_group = QGroupBox("1. Cấu hình nguồn dữ liệu")
         src_form = QFormLayout()
 
         self.src_db_path_edit = QLineEdit()
@@ -2386,6 +2450,7 @@ class TopicRunPage(QWidget):
         src_form.addRow("File CSDL:", row1)
 
         self.src_table_combo = QComboBox()
+        self.src_table_combo.currentTextChanged.connect(self.load_src_columns)
         src_form.addRow("Bảng dữ liệu:", self.src_table_combo)
 
         self.read_src_cols_btn = QPushButton("Đọc cột & tải danh sách kỳ")
@@ -2397,10 +2462,9 @@ class TopicRunPage(QWidget):
 
         self.ky_qt_value_combo = QComboBox()
         self.ky_qt_value_combo.setEditable(True)
-        src_form.addRow("Kỳ quyết toán / Tháng:", self.ky_qt_value_combo)
 
         src_group.setLayout(src_form)
-        layout.addWidget(src_group)
+        columns.addWidget(src_group)
 
         # --- Nhóm 2: Chọn chuyên đề ---
         topic_group = QGroupBox("2. Chọn chuyên đề cần chạy")
@@ -2411,14 +2475,18 @@ class TopicRunPage(QWidget):
         topic_btn_row.addWidget(self.refresh_topic_list_btn)
         topic_layout.addLayout(topic_btn_row)
 
-        self.topic_list = QTableWidget()
-        self.topic_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.topic_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self.topic_list.setMaximumHeight(220)
-        topic_layout.addWidget(QLabel("Giữ Ctrl (hoặc kéo chọn) để chọn nhiều chuyên đề:"))
-        topic_layout.addWidget(self.topic_list)
+        self.topic_combo = QComboBox()
+        self.topic_combo.setMinimumWidth(320)
+        choose_form = QFormLayout()
+        choose_form.addRow("Mã chuyên đề:", self.topic_combo)
+        choose_form.addRow("Tháng (KY_QT):", self.ky_qt_value_combo)
+        topic_layout.addLayout(choose_form)
         topic_group.setLayout(topic_layout)
-        layout.addWidget(topic_group)
+        columns.addWidget(topic_group)
+        columns.setStretchFactor(0, 1)
+        columns.setStretchFactor(1, 1)
+        columns.setSizes([600, 600])
+        layout.addWidget(columns)
 
         btn_row = QHBoxLayout()
         self.run_btn = QPushButton("Chạy")
@@ -2429,7 +2497,12 @@ class TopicRunPage(QWidget):
         self.export_btn.setEnabled(False)
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.export_btn)
-        layout.addLayout(btn_row)
+        topic_layout.addStretch()
+        topic_layout.addLayout(btn_row)
+
+        self.result_table = QTableWidget()
+        self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.result_table, 2)
 
         self.progress = QProgressBar()
         layout.addWidget(self.progress)
@@ -2437,6 +2510,7 @@ class TopicRunPage(QWidget):
         layout.addWidget(QLabel("Chi tiết các bước đang xử lý:"))
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(100)
         layout.addWidget(self.log_box, stretch=1)
 
     def append_log(self, text):
@@ -2450,13 +2524,24 @@ class TopicRunPage(QWidget):
         if not path:
             return
         self.src_db_path_edit.setText(path)
+        self.load_source_tables()
+
+    def load_source_tables(self, preferred_table=""):
         try:
-            conn = sqlite3.connect(path)
+            conn = sqlite3.connect(self.src_db_path_edit.text().strip())
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             tables = [r[0] for r in cur.fetchall()]
             conn.close()
+            self.src_table_combo.blockSignals(True)
             self.src_table_combo.clear()
             self.src_table_combo.addItems(tables)
+            if preferred_table in tables:
+                self.src_table_combo.setCurrentText(preferred_table)
+            elif "XML1" in tables:
+                self.src_table_combo.setCurrentText("XML1")
+            self.src_table_combo.blockSignals(False)
+            if tables:
+                self.load_src_columns()
             self.append_log(f"Đã tìm thấy {len(tables)} bảng trong CSDL.")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không thể đọc danh sách bảng:\n{e}")
@@ -2469,27 +2554,31 @@ class TopicRunPage(QWidget):
             return
         try:
             conn = sqlite3.connect(db_path)
-            cur = conn.execute(f'PRAGMA table_info("{table}")')
+            cur = conn.execute(f'PRAGMA table_info({quote_sql_identifier(table)})')
             columns = [row[1] for row in cur.fetchall()]
             self.src_columns = columns
 
             self.col_ky_qt_combo.clear()
             self.col_ky_qt_combo.addItems(columns)
-            if "KY_QT" in columns:
-                self.col_ky_qt_combo.setCurrentText("KY_QT")
+            ky_column = next((c for c in columns if c.upper() == "KY_QT"), "")
+            if ky_column:
+                self.col_ky_qt_combo.setCurrentText(ky_column)
 
             ky_col = self.col_ky_qt_combo.currentText().strip()
             self.ky_qt_value_combo.clear()
             if ky_col:
                 try:
                     vals_df = pd.read_sql_query(
-                        f'SELECT DISTINCT "{ky_col}" AS v FROM "{table}" ORDER BY v DESC', conn
+                        f'SELECT DISTINCT {quote_sql_identifier(ky_col)} AS v FROM {quote_sql_identifier(table)} ORDER BY v DESC', conn
                     )
                     vals = [str(v) for v in vals_df["v"].dropna().tolist()]
                     self.ky_qt_value_combo.addItems(vals)
                 except Exception:
                     pass
             conn.close()
+            settings = QSettings("BHYT", "XML1")
+            settings.setValue("topics/source_path", db_path)
+            settings.setValue("topics/source_table", table)
             self.append_log(
                 f"Đã đọc {len(columns)} cột và {self.ky_qt_value_combo.count()} giá trị kỳ "
                 f"từ bảng '{table}'."
@@ -2504,10 +2593,13 @@ class TopicRunPage(QWidget):
             df = pd.read_sql_query("SELECT * FROM DINH_NGHIA_CHUYEN_DE ORDER BY MA_CHUYEN_DE", conn)
             conn.close()
             self.topic_defs_df = df
-            fill_table_widget(
-                self.topic_list, df,
-                ["MA_CHUYEN_DE", "TEN_CHUYEN_DE", "TEN_SHEET", "NOI_DUNG_CANH_BAO"]
-            )
+            previous = self.topic_combo.currentData()
+            self.topic_combo.clear()
+            for _, row in df.iterrows():
+                self.topic_combo.addItem(f"{row['MA_CHUYEN_DE']} — {row['TEN_CHUYEN_DE']}", row["MA_CHUYEN_DE"])
+            index = self.topic_combo.findData(previous)
+            if index >= 0:
+                self.topic_combo.setCurrentIndex(index)
             self.append_log(f"Đã tải {len(df)} chuyên đề khả dụng.")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không tải được danh sách chuyên đề:\n{e}")
@@ -2527,16 +2619,19 @@ class TopicRunPage(QWidget):
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn cột KY_QT và kỳ cần chạy.")
             return
 
-        selected_rows = sorted({idx.row() for idx in self.topic_list.selectedIndexes()})
-        if not selected_rows or self.topic_defs_df is None:
+        code = self.topic_combo.currentData()
+        if not code or self.topic_defs_df is None:
             QMessageBox.warning(self, "Chưa chọn chuyên đề", "Vui lòng chọn ít nhất 1 chuyên đề.")
             return
-        topic_rows = [self.topic_defs_df.iloc[i].to_dict() for i in selected_rows]
+        topic_rows = self.topic_defs_df[self.topic_defs_df["MA_CHUYEN_DE"] == code].to_dict("records")
 
         self.run_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
         self.progress.setValue(0)
         self.log_box.clear()
+        self.results = None
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
 
         self.run_worker = TopicRunWorker(db_path, table, col_ky_qt, ky_qt_value, topic_rows)
         self.run_worker.log.connect(self.append_log)
@@ -2550,6 +2645,10 @@ class TopicRunPage(QWidget):
         self.run_btn.setEnabled(True)
         total_rows = sum(len(df) for df in results.values())
         self.export_btn.setEnabled(total_rows > 0)
+        if results:
+            df = next(iter(results.values()))
+            fill_table_widget(self.result_table, df, list(df.columns))
+            self.append_log(f"Xem trước tối đa 1.000 dòng; xuất Excel để lấy đủ {total_rows:,} dòng.")
         QMessageBox.information(
             self, "Hoàn tất",
             f"Đã chạy {len(results)} chuyên đề, tổng {total_rows} dòng kết quả.\n"
@@ -2684,18 +2783,23 @@ class MergeSheetsToSingleWorker(QThread):
     finished_ok = pyqtSignal(object, int, int)  # merged_df, total_sheets, total_rows
     failed = pyqtSignal(str)
 
-    def __init__(self, file_path, selected_sheets, add_sheet_col=True, sheet_col_name="TEN_SHEET", skip_empty=True):
+    def __init__(self, file_path, selected_sheets, add_sheet_col=True, sheet_col_name="TEN_SHEET", skip_empty=True, selected_columns=None):
         super().__init__()
         self.file_path = file_path
         self.selected_sheets = selected_sheets
         self.add_sheet_col = add_sheet_col
         self.sheet_col_name = sheet_col_name.strip() or "TEN_SHEET"
         self.skip_empty = skip_empty
+        self.selected_columns = selected_columns
 
     def run(self):
         try:
             if not self.selected_sheets:
                 raise ValueError("Không có sheet nào được chọn để ghép.")
+            if self.selected_columns is not None and not self.selected_columns:
+                raise ValueError("Vui lòng chọn ít nhất một cột để ghép.")
+            if self.selected_columns is not None and self.add_sheet_col and self.sheet_col_name in self.selected_columns:
+                raise ValueError("Tên cột nguồn sheet trùng với cột dữ liệu đã chọn. Hãy đổi tên cột nguồn.")
 
             self.log.emit("Đang mở file Excel...")
             total = len(self.selected_sheets)
@@ -2716,6 +2820,14 @@ class MergeSheetsToSingleWorker(QThread):
                             self.log.emit(f"  -> Sheet '{sname}' rỗng, bỏ qua.")
                             continue
 
+                        if self.selected_columns is not None:
+                            if df.columns.duplicated().any():
+                                raise ValueError("Có tên cột trùng nhau sau khi bỏ khoảng trắng.")
+                            missing = [c for c in self.selected_columns if c not in df.columns]
+                            if missing:
+                                self.log.emit(f"  -> Cột thiếu, để trống: {', '.join(missing)}")
+                            df = df.reindex(columns=self.selected_columns)
+
                         if self.add_sheet_col:
                             if self.sheet_col_name in df.columns:
                                 df[self.sheet_col_name] = sname
@@ -2726,6 +2838,8 @@ class MergeSheetsToSingleWorker(QThread):
                         processed_sheets += 1
                         self.log.emit(f"  -> Sheet '{sname}': {len(df)} dòng, {len(df.columns)} cột.")
                     except Exception as e_s:
+                        if self.selected_columns is not None:
+                            raise ValueError(f"Không thể ghép sheet '{sname}': {e_s}") from e_s
                         self.log.emit(f"  [!] Lỗi khi đọc sheet '{sname}': {e_s}")
 
                     pct = 10 + int(idx / total * 75)
@@ -2898,6 +3012,7 @@ class MergeSheetsToSinglePage(QWidget):
     def __init__(self):
         super().__init__()
         self.merged_df = None
+        self.column_source_signature = None
         self._build_ui()
 
     def _build_ui(self):
@@ -2968,7 +3083,35 @@ class MergeSheetsToSinglePage(QWidget):
         form.addRow("Sheet tổng hợp:", self.create_summary_check)
 
         group.setLayout(form)
-        layout.addWidget(group)
+        config_columns = QSplitter(Qt.Orientation.Horizontal)
+        config_columns.setChildrenCollapsible(False)
+        config_columns.addWidget(group)
+
+        self.column_group = QGroupBox("Chỉ ghép các cột được chọn theo tên")
+        self.column_group.setCheckable(True)
+        self.column_group.setChecked(False)
+        column_layout = QVBoxLayout(self.column_group)
+        column_note = QLabel("Tải tên cột từ các sheet đã chọn rồi tích các cột cần ghép. Cột thiếu ở một sheet sẽ để trống. Bỏ tích nhóm này để ghép tất cả cột như trước.")
+        column_note.setWordWrap(True)
+        column_layout.addWidget(column_note)
+        self.load_columns_btn = QPushButton("Tải tên cột từ các sheet đã chọn")
+        self.load_columns_btn.clicked.connect(self.load_merge_columns)
+        column_layout.addWidget(self.load_columns_btn)
+        self.merge_column_list = QListWidget()
+        self.merge_column_list.setMinimumHeight(100)
+        column_layout.addWidget(self.merge_column_list, 1)
+        column_buttons = QHBoxLayout()
+        for label, mode in [("Chọn tất cả", "all"), ("Chỉ cột chung", "common"), ("Bỏ chọn", "none")]:
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, mode=mode: self.select_merge_columns(mode))
+            column_buttons.addWidget(button)
+        column_layout.addLayout(column_buttons)
+        config_columns.addWidget(self.column_group)
+        config_columns.setStretchFactor(0, 1)
+        config_columns.setStretchFactor(1, 1)
+        layout.addWidget(config_columns)
+        self.file_path_edit.textChanged.connect(self.invalidate_merge_columns)
+        self.sheet_list.itemChanged.connect(self.invalidate_merge_columns)
 
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton("Bắt đầu ghép các sheet")
@@ -3051,6 +3194,49 @@ class MergeSheetsToSinglePage(QWidget):
                 selected.append(item.text())
         return selected
 
+    def invalidate_merge_columns(self, *args):
+        self.column_source_signature = None
+        self.merge_column_list.clear()
+
+    def merge_source_signature(self):
+        path = os.path.abspath(self.file_path_edit.text().strip())
+        stat = os.stat(path)
+        return (path, stat.st_mtime_ns, stat.st_size, tuple(self.get_selected_sheets()))
+
+    def load_merge_columns(self):
+        try:
+            signature = self.merge_source_signature()
+            sheets = signature[3]
+            if not sheets:
+                raise ValueError("Vui lòng chọn ít nhất một sheet.")
+            counts = {}
+            with pd.ExcelFile(signature[0]) as workbook:
+                for sheet in sheets:
+                    names = [str(c).strip() for c in pd.read_excel(workbook, sheet_name=sheet, nrows=0).columns]
+                    if len(names) != len(set(names)):
+                        raise ValueError(f"Sheet '{sheet}' có tên cột trùng sau khi bỏ khoảng trắng.")
+                    for name in names:
+                        counts[name] = counts.get(name, 0) + 1
+            self.merge_column_list.clear()
+            for name, count in counts.items():
+                item = QListWidgetItem(f"{name}  ({count}/{len(sheets)} sheet)")
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                item.setData(Qt.ItemDataRole.UserRole + 1, count == len(sheets))
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked)
+                self.merge_column_list.addItem(item)
+            self.column_source_signature = signature
+            self.append_log(f"Đã tải {len(counts)} tên cột từ {len(sheets)} sheet; có thể chọn Chỉ cột chung.")
+        except Exception as e:
+            self.invalidate_merge_columns()
+            QMessageBox.warning(self, "Không tải được tên cột", str(e))
+
+    def select_merge_columns(self, mode):
+        for index in range(self.merge_column_list.count()):
+            item = self.merge_column_list.item(index)
+            checked = mode == "all" or (mode == "common" and item.data(Qt.ItemDataRole.UserRole + 1))
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
     def run_merge(self):
         file_path = self.file_path_edit.text().strip()
         if not file_path or not os.path.isfile(file_path):
@@ -3066,6 +3252,23 @@ class MergeSheetsToSinglePage(QWidget):
         col_name = self.origin_col_edit.text().strip() or "TEN_SHEET"
         skip_empty = self.skip_empty_check.isChecked()
 
+        selected_columns = None
+        if self.column_group.isChecked():
+            if self.column_source_signature != self.merge_source_signature():
+                QMessageBox.warning(self, "Cần tải tên cột", "Vui lòng tải lại tên cột từ các sheet đang chọn trước khi ghép.")
+                return
+            selected_columns = [
+                self.merge_column_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self.merge_column_list.count())
+                if self.merge_column_list.item(i).checkState() == Qt.CheckState.Checked
+            ]
+            if not selected_columns:
+                QMessageBox.warning(self, "Chưa chọn cột", "Vui lòng tích ít nhất một cột cần ghép.")
+                return
+            if add_col and col_name in selected_columns:
+                QMessageBox.warning(self, "Trùng tên cột", "Hãy đổi tên cột nguồn sheet để không trùng cột dữ liệu đã chọn.")
+                return
+
         self.start_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
         self.progress.setValue(0)
@@ -3078,7 +3281,8 @@ class MergeSheetsToSinglePage(QWidget):
             file_path, selected_sheets,
             add_sheet_col=add_col,
             sheet_col_name=col_name,
-            skip_empty=skip_empty
+            skip_empty=skip_empty,
+            selected_columns=selected_columns
         )
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.progress.setValue)
@@ -3220,8 +3424,6 @@ RADIUS_LG = 8
 RADIUS_XL = 12
 RADIUS_FULL = 9999
 
-SIDEBAR_WIDTH = 260
-
 
 def page_title(text: str) -> QLabel:
     lbl = QLabel(text)
@@ -3257,52 +3459,6 @@ QScrollBar::handle:vertical:hover {{
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-
-/* ─── Sidebar ───────────────────────────────────── */
-#sidebar {{
-    background-color: {COLOR_SURFACE};
-    border-right: 1px solid {COLOR_OUTLINE_VARIANT};
-}}
-#appTitle {{
-    font-family: {FONT_HEADING_STACK};
-    font-size: 18px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    color: {COLOR_ON_SURFACE};
-    padding: {SPACING_LG}px {SPACING_MD}px {SPACING_XS}px {SPACING_MD}px;
-}}
-#appSubtitle {{
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    color: {COLOR_ON_SURFACE_VARIANT};
-    padding: 0 {SPACING_MD}px {SPACING_LG}px {SPACING_MD}px;
-}}
-#sidebarNavItem {{
-    background: transparent;
-    border: none;
-    border-left: 3px solid transparent;
-    border-radius: 0;
-    text-align: left;
-    padding: {SPACING_SM}px {SPACING_MD}px;
-    color: {COLOR_ON_SURFACE_VARIANT};
-    font-size: 14px;
-    font-weight: 500;
-    min-height: 40px;
-}}
-#sidebarNavItem:hover {{
-    background-color: {COLOR_SURFACE_HIGH};
-    color: {COLOR_ON_SURFACE};
-}}
-#sidebarNavItem[active="true"] {{
-    background-color: {COLOR_PRIMARY_FIXED};
-    color: {COLOR_PRIMARY};
-    border-left: 3px solid {COLOR_PRIMARY};
-    font-weight: 700;
-}}
-#sidebarNavItem[active="true"]:hover {{
-    background-color: {COLOR_PRIMARY_FIXED};
-}}
 
 /* ─── Buttons ───────────────────────────────────── */
 QPushButton {{
@@ -3519,101 +3675,16 @@ QMessageBox {{
 """
 
 
-class MainWindow(QMainWindow):
+class MainWindow(RibbonMainWindow):
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Phần mềm nghiệp vụ BHYT - Giám định XML1")
-        self.resize(1280, 840)
-
-        central = QWidget()
-        central.setObjectName("contentArea")
-        root_layout = QHBoxLayout(central)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-
-        # --- Sidebar (theo component_library.md: SidebarNav) ---
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(SIDEBAR_WIDTH)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(0, SPACING_SM, 0, SPACING_MD)
-        sidebar_layout.setSpacing(0)
-
-        title = QLabel("BHYT · GIÁM ĐỊNH")
-        title.setObjectName("appTitle")
-        subtitle = QLabel("CÔNG CỤ XỬ LÝ DỮ LIỆU XML1")
-        subtitle.setObjectName("appSubtitle")
-        sidebar_layout.addWidget(title)
-        sidebar_layout.addWidget(subtitle)
-
-        menu_items = [
-            ("🔎", "Tra cứu dữ liệu XML1"),
-            ("🗂", "Tách Excel theo MA_CSKCB"),
-            ("📊", "Tổng hợp trừ chi phí theo chuyên đề"),
-            ("💾", "Lưu hồ sơ đã trừ & Kiểm tra trùng"),
-            ("🧩", "Định nghĩa chuyên đề (SQL)"),
-            ("▶️", "Chạy chuyên đề theo kỳ"),
-            ("📁", "Ghép Folder Excel -> Nhiều Sheet"),
-            ("📑", "Ghép Nhiều Sheet -> 1 Sheet"),
-        ]
-        self._nav_buttons = []
-        for icon, label in menu_items:
-            btn = self._make_nav_button(icon, label)
-            sidebar_layout.addWidget(btn)
-            self._nav_buttons.append(btn)
-
-        sidebar_layout.addStretch()
-        root_layout.addWidget(sidebar)
-
-        # --- Content stack ---
-        self.stack = QStackedWidget()
-        self.stack.addWidget(LookupPage())
-        self.stack.addWidget(SplitPage())
-        self.stack.addWidget(ExcludeSummaryPage())
-        self.stack.addWidget(SaveDeductedPage())
-        self.stack.addWidget(TopicManagePage())
-        self.stack.addWidget(TopicRunPage())
-        self.stack.addWidget(MergeFolderToSheetsPage())
-        self.stack.addWidget(MergeSheetsToSinglePage())
-        root_layout.addWidget(self.stack, stretch=1)
-
-        self.setCentralWidget(central)
-        self._set_active_index(0)
-
-    def _make_nav_button(self, icon: str, label: str) -> QPushButton:
-        btn = QPushButton()
-        btn.setObjectName("sidebarNavItem")
-        btn.setProperty("active", False)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFixedHeight(44)
-
-        row = QHBoxLayout(btn)
-        row.setContentsMargins(SPACING_MD, 0, SPACING_MD, 0)
-        row.setSpacing(SPACING_SM + SPACING_XS)
-
-        icon_lbl = QLabel(icon)
-        icon_lbl.setFixedWidth(22)
-        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
-        text_lbl = QLabel(label)
-        text_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        text_lbl.setWordWrap(False)
-
-        row.addWidget(icon_lbl)
-        row.addWidget(text_lbl)
-        row.addStretch()
-
-        idx = len(self._nav_buttons) if hasattr(self, "_nav_buttons") else 0
-        btn.clicked.connect(lambda checked=False, i=idx: self._set_active_index(i))
-        return btn
-
-    def _set_active_index(self, index: int):
-        self.stack.setCurrentIndex(index)
-        for i, btn in enumerate(self._nav_buttons):
-            btn.setProperty("active", i == index)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+        super().__init__([
+            LookupPage, SplitPage, ExcludeSummaryPage, SaveDeductedPage,
+            TopicManagePage, TopicRunPage, MergeFolderToSheetsPage,
+            MergeSheetsToSinglePage,
+            lambda: CatalogPage(DB_PATH, "loai_kcb"),
+            lambda: CatalogPage(DB_PATH, "cskcb"),
+        ])
+        self.stack.widget(4).definitionsChanged.connect(self.stack.widget(5).refresh_topic_list)
 
 
 def main():
