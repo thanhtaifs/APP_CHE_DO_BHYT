@@ -15,6 +15,30 @@ hiển thị bên dưới; nút đang chọn được tô xanh. Gồm 8 chức n
 
 ## 1. Cài đặt
 
+Cần Python **3.10 trở lên**. Từ thư mục dự án, tạo môi trường và cài thư viện:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Chạy ứng dụng từ mã nguồn:
+
+```powershell
+.\.venv\Scripts\python.exe app_tra_cuu_xml1.py
+```
+
+Đóng gói ứng dụng Windows bằng PyInstaller:
+
+```powershell
+.\.venv\Scripts\python.exe -m PyInstaller "BHXH Tool.spec"
+```
+
+Ứng dụng đóng gói nằm trong `dist\BHXH Tool`; cấu hình build kèm `database\DB.sqlite`
+trong thư mục `database` cạnh file `.exe`. Sau khi cập nhật mã nguồn, hãy build lại thay vì dùng các
+file cũ trong `build` hoặc `dist`.
+
 ### Cách dùng chuyên đề SQL
 
 - **Định nghĩa chuyên đề:** nhập mã, tên, ghi chú và dán SQL vào ô nhiều dòng.
@@ -31,21 +55,12 @@ hiển thị bên dưới; nút đang chọn được tô xanh. Gồm 8 chức n
   bỏ hoặc đổi thành `:KY_QT` để dùng theo tháng đang chọn.
 - Cột ghi chú được bổ sung tự động khi mở ứng dụng; giữ lại các định nghĩa cũ.
 
-```
-pip install -r requirements.txt
-```
-
 Giữ `app_tra_cuu_xml1.py`, `ribbon_ui.py` và `danh_muc_ui.py` **cùng 1 thư mục**.
-Cài thư viện bằng `pip install PyQt6 pandas openpyxl` nếu không có `requirements.txt`.
-`DB.sqlite` là CSDL dùng chung (đã tạo sẵn 2 bảng rỗng — xem mục 4, 5). Nếu
-thiếu file `DB.sqlite`, phần mềm sẽ tự tạo lại khi dùng lần đầu, nên không bắt
-buộc phải có sẵn.
-
-Chạy chương trình:
-
-```
-python app_tra_cuu_xml1.py
-```
+`database/DB.sqlite` là CSDL dùng chung. Ứng dụng luôn dùng file trong thư mục
+`database` cạnh mã nguồn hoặc file `.exe`, không phụ thuộc thư mục đang chạy lệnh.
+Nếu file này chưa tồn tại nhưng có `DB.sqlite` cũ ở thư mục gốc, ứng dụng sao lưu
+bản cũ sang vị trí mới và giữ nguyên bản gốc. Nếu cả hai đều thiếu, ứng dụng tạo
+CSDL mới trong `database`. File đã có trong `database` không bị ghi đè.
 
 `ribbon_ui.py` quản lý cửa sổ chính, các tab, nhóm nút và icon ribbon.
 Chỉnh `RIBBON_TABS` để đổi tên, icon hoặc nhóm chức năng.
@@ -258,10 +273,14 @@ chuyên đề.
   thay vì truy vấn từng dòng, xử lý nhanh hơn với file lớn.
 - **CSDL dùng chung `DB.sqlite`**: gồm 2 bảng — `HO_SO_DA_TRU` (mục 5) và
   `DINH_NGHIA_CHUYEN_DE` (mục 6). Đường dẫn tính tự động và cố định qua hàm
-  `get_app_dir()` (biến `DB_PATH` ở đầu file `app_tra_cuu_xml1.py`): cùng thư
-  mục với file `.py` khi chạy script, hoặc cùng thư mục với file `.exe` khi đã
+  `get_app_dir()` (biến `DB_PATH` ở đầu file `app_tra_cuu_xml1.py`): nằm trong thư
+  mục `database` cạnh file `.py` khi chạy script, hoặc cạnh file `.exe` khi đã
   đóng gói (kiểm tra qua `sys.frozen`). Muốn đổi tên/vị trí file CSDL, chỉnh
   biến `DB_PATH` này — mọi chức năng liên quan sẽ tự dùng theo.
+- Đọc tên cột, danh sách sheet, tên bảng, danh sách kỳ và xuất Excel/CSV cũng
+  chạy trên QThread. Trang đang xử lý tạm khóa thao tác; vẫn có thể chuyển sang
+  trang khác. Lỗi được báo trên giao diện và trang được mở lại sau khi luồng kết
+  thúc. Khi còn tác vụ, ứng dụng yêu cầu chờ hoàn tất trước khi đóng cửa sổ.
 - CSDL nguồn dùng ở mục 2 (Tra cứu XML1) và CSDL ngoài chọn ở mục 6 (Chạy
   chuyên đề theo kỳ) là dữ liệu **của riêng bạn**, do bạn tự chọn đường dẫn
   mỗi lần — khác với `DB.sqlite` (CSDL nội bộ, cố định, do phần mềm quản lý).

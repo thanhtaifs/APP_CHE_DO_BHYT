@@ -24,13 +24,15 @@ import sys
 import sqlite3
 import traceback
 import unicodedata
+from pathlib import Path
+from contextlib import closing
 
 import pandas as pd
 
 from ribbon_ui import RibbonMainWindow
 from danh_muc_ui import CatalogPage
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QSettings
+from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot, QUrl, QSettings
 from PyQt6.QtGui import QDesktopServices, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QListWidget,
@@ -47,7 +49,7 @@ def get_app_dir() -> str:
     """
     Thư mục chứa ứng dụng: nếu chạy dạng file .py thì là thư mục chứa file
     này; nếu đã đóng gói thành .exe (PyInstaller...) thì là thư mục chứa file
-    .exe. Dùng để đặt CSDL "hồ sơ đã trừ" cố định cạnh chương trình, không cần
+    .exe. Dùng để đặt thư mục database cố định cạnh chương trình, không cần
     người dùng chọn đường dẫn mỗi lần.
     """
     if getattr(sys, "frozen", False):
@@ -58,7 +60,83 @@ def get_app_dir() -> str:
 # CSDL SQLite DUY NHẤT cho toàn bộ phần mềm - đường dẫn CỐ ĐỊNH, gắn kèm dự án/gói
 # cài đặt. Gồm nhiều bảng: HO_SO_DA_TRU (hồ sơ đã trừ), QUY_TAC_BENH (quy tắc giám
 # định theo chuyên đề)...
-DB_PATH = os.path.join(get_app_dir(), "DB.sqlite")
+DB_PATH = os.path.join(get_app_dir(), "database", "DB.sqlite")
+
+
+def initialize_app_database():
+    """Ưu tiên database/DB.sqlite; sao lưu bản cũ chỉ khi chưa có file mới."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    legacy_path = os.path.join(get_app_dir(), "DB.sqlite")
+    if not os.path.exists(DB_PATH) and os.path.isfile(legacy_path):
+        with closing(sqlite3.connect(Path(legacy_path).resolve().as_uri() + '?mode=ro', uri=True)) as source:
+            with closing(sqlite3.connect(DB_PATH)) as target:
+                source.backup(target)
+
+
+class FunctionWorker(QThread):
+    """Chỉ xử lý dữ liệu; callback giao diện được gọi sau khi luồng kết thúc."""
+    def __init__(self, operation, parent):
+        super().__init__(parent)
+        self.operation = operation
+        self.result = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.result = self.operation()
+        except Exception:
+            self.error = traceback.format_exc()
+
+
+class BackgroundTask(QObject):
+    def __init__(self, page, operation, on_done):
+        super().__init__(page)
+        self.page = page
+        self.on_done = on_done
+        self.was_enabled = page.isEnabled()
+        self.previous_cursor = page.cursor()
+        self.worker = FunctionWorker(operation, self)
+        self.worker.finished.connect(self.finish)
+        page.setEnabled(False)
+        page.setCursor(Qt.CursorShape.WaitCursor)
+
+    @pyqtSlot()
+    def finish(self):
+        self.page.setEnabled(self.was_enabled)
+        self.page.setCursor(self.previous_cursor)
+        self.page._background_task = None
+        try:
+            if self.worker.error:
+                QMessageBox.critical(self.page, "Lỗi xử lý", self.worker.error)
+            else:
+                self.on_done(self.worker.result)
+        except Exception:
+            QMessageBox.critical(self.page, "Lỗi cập nhật kết quả", traceback.format_exc())
+        finally:
+            self.deleteLater()
+
+
+def run_in_background(page, operation, on_done):
+    if getattr(page, "_background_task", None) is not None:
+        return
+    if any(isinstance(value, QThread) and value.isRunning() for value in vars(page).values()):
+        page.append_log("Đang xử lý tác vụ trước, vui lòng chờ hoàn tất.")
+        return
+    task = BackgroundTask(page, operation, on_done)
+    page._background_task = task
+    task.worker.start()
+
+
+def open_source_database(path):
+    """CSDL nguồn phải tồn tại; không tự tạo file rỗng nếu sai đường dẫn."""
+    return sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
+
+
+def read_source_tables(path):
+    with closing(open_source_database(path)) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )]
 
 # ============================================================
 # CẤU HÌNH DANH SÁCH CỘT NGHIỆP VỤ (CHỨC NĂNG TRA CỨU XML1)
@@ -1214,17 +1292,12 @@ class LookupPage(QWidget):
         self.load_tables(path)
 
     def load_tables(self, db_path):
-        self.table_combo.clear()
-        try:
-            conn = sqlite3.connect(db_path)
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            tables = [r[0] for r in cur.fetchall()]
-            conn.close()
+        def apply_tables(tables):
+            self.table_combo.clear()
             self.table_combo.addItems(tables)
             self.append_log(f"Đã tìm thấy {len(tables)} bảng trong CSDL.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể đọc danh sách bảng:\n{e}")
+
+        run_in_background(self, lambda: read_source_tables(db_path), apply_tables)
 
     def browse_input(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1241,8 +1314,7 @@ class LookupPage(QWidget):
         if not path:
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file đầu vào trước.")
             return
-        try:
-            df = read_table_any(path)
+        def apply_columns(df):
             self.input_df_columns = list(df.columns)
 
             self.col_xml1_combo.clear()
@@ -1273,8 +1345,8 @@ class LookupPage(QWidget):
                     break
 
             self.append_log(f"Đã đọc {len(self.input_df_columns)} cột từ file đầu vào.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được file đầu vào:\n{e}")
+
+        run_in_background(self, lambda: read_table_any(path), apply_columns)
 
     def run_lookup(self):
         db_path = self.db_path_edit.text().strip()
@@ -1335,13 +1407,18 @@ class LookupPage(QWidget):
         )
         if not path:
             return
-        try:
-            export_columns = self.selected_template_columns()
-            export_df = self.result_df.reindex(columns=export_columns, fill_value="")
+        columns = self.selected_template_columns()
+        result_df = self.result_df
+
+        def write_file():
+            export_columns = columns
+            export_df = result_df.reindex(columns=export_columns, fill_value="")
             export_df.to_excel(path, index=False)
+
+        def on_saved(_):
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
+
+        run_in_background(self, write_file, on_saved)
 
 
 # ============================================================
@@ -1422,16 +1499,15 @@ class SplitPage(QWidget):
         if not path:
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel trước.")
             return
-        try:
-            df = read_table_any(path)
+        def apply_columns(df):
             self.input_columns = list(df.columns)
             self.split_col_combo.clear()
             self.split_col_combo.addItems(self.input_columns)
             if "MA_CSKCB" in self.input_columns:
                 self.split_col_combo.setCurrentText("MA_CSKCB")
             self.append_log(f"Đã đọc {len(self.input_columns)} cột từ file.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được file:\n{e}")
+
+        run_in_background(self, lambda: read_table_any(path), apply_columns)
 
     def browse_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục đích")
@@ -1589,8 +1665,7 @@ class ExcludeSummaryPage(QWidget):
         if not path:
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel trước.")
             return
-        try:
-            df = read_table_any(path)
+        def apply_columns(df):
             self.input_columns = list(df.columns)
 
             def fill_combo(combo, guesses, allow_none=False):
@@ -1620,8 +1695,8 @@ class ExcludeSummaryPage(QWidget):
                        ["GHI_CHU_KHONG_TRU", "GHI_CHU"], allow_none=True)
 
             self.append_log(f"Đã đọc {len(self.input_columns)} cột từ file.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được file:\n{e}")
+
+        run_in_background(self, lambda: read_table_any(path), apply_columns)
 
     def _validate_common(self):
         input_path = self.input_path_edit.text().strip()
@@ -1717,14 +1792,20 @@ class ExcludeSummaryPage(QWidget):
         )
         if not path:
             return
-        try:
+        summary_cd_loai_df = self.summary_cd_loai_df
+        summary_cd_df = self.summary_cd_df
+        detail_df = self.detail_df
+
+        def write_file():
             with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                self.summary_cd_df.to_excel(writer, sheet_name="Tong_Hop_Chuyen_De", index=False)
-                self.summary_cd_loai_df.to_excel(writer, sheet_name="Tong_Hop_Loai_Ho_So", index=False)
-                self.detail_df.to_excel(writer, sheet_name="Chi_Tiet", index=False)
+                summary_cd_df.to_excel(writer, sheet_name="Tong_Hop_Chuyen_De", index=False)
+                summary_cd_loai_df.to_excel(writer, sheet_name="Tong_Hop_Loai_Ho_So", index=False)
+                detail_df.to_excel(writer, sheet_name="Chi_Tiet", index=False)
+
+        def on_saved(_):
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
+
+        run_in_background(self, write_file, on_saved)
 
 
 # ============================================================
@@ -1991,8 +2072,7 @@ class SaveDeductedPage(QWidget):
         if not path:
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file Excel trước.")
             return
-        try:
-            df = read_table_any(path)
+        def apply_columns(df):
             self.input_columns = list(df.columns)
 
             def fill_combo(combo, guesses, allow_none=False):
@@ -2014,8 +2094,8 @@ class SaveDeductedPage(QWidget):
             fill_combo(self.col_trang_thai_combo, ["TRANG_THAI_TRU"], allow_none=True)
 
             self.append_log(f"Đã đọc {len(self.input_columns)} cột, {len(df)} dòng từ file.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được file:\n{e}")
+
+        run_in_background(self, lambda: read_table_any(path), apply_columns)
 
     def open_db_folder(self):
         folder = os.path.dirname(DB_PATH)
@@ -2192,28 +2272,32 @@ class SaveDeductedPage(QWidget):
         )
         if not path:
             return
-        try:
+        full_file_df = self.full_file_df
+        current_result_df = self.current_result_df
+
+        def write_file():
             if path.lower().endswith(".csv"):
-                df_to_save = self.full_file_df if has_full else self.current_result_df
+                df_to_save = full_file_df if has_full else current_result_df
                 df_to_save.to_csv(path, index=False, encoding="utf-8-sig")
             else:
                 with pd.ExcelWriter(path, engine="openpyxl") as writer:
                     if has_dup:
-                        self.current_result_df.to_excel(writer, sheet_name="DANH_SACH_TRUNG", index=False)
+                        current_result_df.to_excel(writer, sheet_name="DANH_SACH_TRUNG", index=False)
                     if has_full:
-                        self.full_file_df.to_excel(writer, sheet_name="TOAN_BO_FILE", index=False)
+                        full_file_df.to_excel(writer, sheet_name="TOAN_BO_FILE", index=False)
 
+        def on_saved(_):
             msg = f"Đã xuất file thành công:\n{path}\n\n"
             msg += "✓ Đã thêm cột 'TRUNG_CD' và đánh dấu 'X' cho các trường hợp trùng.\n"
             if has_dup and has_full:
-                msg += f"• Sheet 'DANH_SACH_TRUNG': {len(self.current_result_df)} dòng bị trùng.\n"
-                msg += f"• Sheet 'TOAN_BO_FILE': Toàn bộ {len(self.full_file_df)} dòng của file."
+                msg += f"• Sheet 'DANH_SACH_TRUNG': {len(current_result_df)} dòng bị trùng.\n"
+                msg += f"• Sheet 'TOAN_BO_FILE': Toàn bộ {len(full_file_df)} dòng của file."
             elif has_full:
-                msg += f"• Sheet 'TOAN_BO_FILE': Toàn bộ {len(self.full_file_df)} dòng của file (không có dòng trùng)."
+                msg += f"• Sheet 'TOAN_BO_FILE': Toàn bộ {len(full_file_df)} dòng của file (không có dòng trùng)."
             QMessageBox.information(self, "Xuất file thành công", msg)
             self.append_log(f"Đã xuất file Excel kết quả ra: {path} (cột TRUNG_CD đánh dấu 'X' dòng trùng)")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi xuất file", f"Không thể lưu file kết quả:\n{e}")
+
+        run_in_background(self, write_file, on_saved)
 
     def run_save_deducted(self):
         worker = self._build_worker("save")
@@ -2570,24 +2654,24 @@ class TopicRunPage(QWidget):
         self.load_source_tables()
 
     def load_source_tables(self, preferred_table=""):
-        try:
-            conn = sqlite3.connect(self.src_db_path_edit.text().strip())
-            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            tables = [r[0] for r in cur.fetchall()]
-            conn.close()
+        db_path = self.src_db_path_edit.text().strip()
+
+        def apply_tables(tables):
             self.src_table_combo.blockSignals(True)
-            self.src_table_combo.clear()
-            self.src_table_combo.addItems(tables)
-            if preferred_table in tables:
-                self.src_table_combo.setCurrentText(preferred_table)
-            elif "XML1" in tables:
-                self.src_table_combo.setCurrentText("XML1")
-            self.src_table_combo.blockSignals(False)
+            try:
+                self.src_table_combo.clear()
+                self.src_table_combo.addItems(tables)
+                if preferred_table in tables:
+                    self.src_table_combo.setCurrentText(preferred_table)
+                elif "XML1" in tables:
+                    self.src_table_combo.setCurrentText("XML1")
+            finally:
+                self.src_table_combo.blockSignals(False)
+            self.append_log(f"Đã tìm thấy {len(tables)} bảng trong CSDL.")
             if tables:
                 self.load_src_columns()
-            self.append_log(f"Đã tìm thấy {len(tables)} bảng trong CSDL.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể đọc danh sách bảng:\n{e}")
+
+        run_in_background(self, lambda: read_source_tables(db_path), apply_tables)
 
     def load_src_columns(self):
         db_path = self.src_db_path_edit.text().strip()
@@ -2595,41 +2679,36 @@ class TopicRunPage(QWidget):
         if not db_path or not table:
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng chọn file CSDL và bảng dữ liệu.")
             return
-        try:
-            conn = sqlite3.connect(db_path)
-            cur = conn.execute(f'PRAGMA table_info({quote_sql_identifier(table)})')
-            columns = [row[1] for row in cur.fetchall()]
-            self.src_columns = columns
 
+        def read_columns_and_periods():
+            with closing(open_source_database(db_path)) as conn:
+                columns = [row[1] for row in conn.execute(f'PRAGMA table_info({quote_sql_identifier(table)})')]
+                ky_column = next((c for c in columns if c.upper() == "KY_QT"), columns[0] if columns else "")
+                values = []
+                if ky_column:
+                    rows = conn.execute(
+                        f'SELECT DISTINCT {quote_sql_identifier(ky_column)} FROM {quote_sql_identifier(table)} '
+                        f'WHERE {quote_sql_identifier(ky_column)} IS NOT NULL ORDER BY 1 DESC'
+                    )
+                    values = [str(row[0]) for row in rows]
+                return columns, ky_column, values
+
+        def apply_columns(result):
+            columns, ky_column, values = result
+            self.src_columns = columns
             self.col_ky_qt_combo.clear()
             self.col_ky_qt_combo.addItems(columns)
-            ky_column = next((c for c in columns if c.upper() == "KY_QT"), "")
-            if ky_column:
-                self.col_ky_qt_combo.setCurrentText(ky_column)
-
-            ky_col = self.col_ky_qt_combo.currentText().strip()
+            self.col_ky_qt_combo.setCurrentText(ky_column)
             self.ky_qt_value_combo.clear()
             self.ky_qt_end_combo.clear()
-            if ky_col:
-                try:
-                    vals_df = pd.read_sql_query(
-                        f'SELECT DISTINCT {quote_sql_identifier(ky_col)} AS v FROM {quote_sql_identifier(table)} ORDER BY v DESC', conn
-                    )
-                    vals = [str(v) for v in vals_df["v"].dropna().tolist()]
-                    self.ky_qt_value_combo.addItems(vals)
-                    self.ky_qt_end_combo.addItems(vals)
-                except Exception:
-                    pass
-            conn.close()
+            self.ky_qt_value_combo.addItems(values)
+            self.ky_qt_end_combo.addItems(values)
             settings = QSettings("BHYT", "XML1")
             settings.setValue("topics/source_path", db_path)
             settings.setValue("topics/source_table", table)
-            self.append_log(
-                f"Đã đọc {len(columns)} cột và {self.ky_qt_value_combo.count()} giá trị kỳ "
-                f"từ bảng '{table}'."
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được dữ liệu:\n{e}")
+            self.append_log(f"Đã đọc {len(columns)} cột và {len(values)} giá trị kỳ từ bảng '{table}'.")
+
+        run_in_background(self, read_columns_and_periods, apply_columns)
 
     def refresh_topic_list(self):
         try:
@@ -2754,13 +2833,17 @@ class TopicRunPage(QWidget):
         )
         if not path:
             return
-        try:
+        results = self.results
+
+        def write_file():
             with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                for sheet_name, df in self.results.items():
+                for sheet_name, df in results.items():
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        def on_saved(_):
             QMessageBox.information(self, "Thành công", f"Đã lưu file:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không thể lưu file:\n{e}")
+
+        run_in_background(self, write_file, on_saved)
 
 
 # ============================================================
@@ -3247,18 +3330,20 @@ class MergeSheetsToSinglePage(QWidget):
         self.load_sheets(path)
 
     def load_sheets(self, path):
-        try:
-            with pd.ExcelFile(path) as excel_obj:
-                sheets = excel_obj.sheet_names
+        def read_sheets():
+            with pd.ExcelFile(path) as workbook:
+                return workbook.sheet_names
+
+        def apply_sheets(sheets):
             self.sheet_list.clear()
-            for sname in sheets:
-                item = QListWidgetItem(sname)
+            for name in sheets:
+                item = QListWidgetItem(name)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked)
                 self.sheet_list.addItem(item)
             self.append_log(f"Đã đọc file: '{os.path.basename(path)}' - Tìm thấy {len(sheets)} sheet.")
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không đọc được danh sách sheet từ file:\n{e}")
+
+        run_in_background(self, read_sheets, apply_sheets)
 
     def select_all_sheets(self):
         for i in range(self.sheet_list.count()):
@@ -3292,6 +3377,12 @@ class MergeSheetsToSinglePage(QWidget):
     def load_merge_columns(self):
         try:
             signature = self.merge_source_signature()
+        except Exception as error:
+            QMessageBox.warning(self, "Không tải được tên cột", str(error))
+            return
+        self.invalidate_merge_columns()
+
+        def read_columns():
             sheets = signature[3]
             if not sheets:
                 raise ValueError("Vui lòng chọn ít nhất một sheet.")
@@ -3303,6 +3394,10 @@ class MergeSheetsToSinglePage(QWidget):
                         raise ValueError(f"Sheet '{sheet}' có tên cột trùng sau khi bỏ khoảng trắng.")
                     for name in names:
                         counts[name] = counts.get(name, 0) + 1
+            return counts
+
+        def apply_columns(counts):
+            sheets = signature[3]
             self.merge_column_list.clear()
             for name, count in counts.items():
                 item = QListWidgetItem(f"{name}  ({count}/{len(sheets)} sheet)")
@@ -3313,9 +3408,8 @@ class MergeSheetsToSinglePage(QWidget):
                 self.merge_column_list.addItem(item)
             self.column_source_signature = signature
             self.append_log(f"Đã tải {len(counts)} tên cột từ {len(sheets)} sheet; có thể chọn Chỉ cột chung.")
-        except Exception as e:
-            self.invalidate_merge_columns()
-            QMessageBox.warning(self, "Không tải được tên cột", str(e))
+
+        run_in_background(self, read_columns, apply_columns)
 
     def select_merge_columns(self, mode):
         for index in range(self.merge_column_list.count()):
@@ -3411,9 +3505,12 @@ class MergeSheetsToSinglePage(QWidget):
         )
         if not path:
             return
-        try:
-            detail_df = prepare_money_columns_for_excel(self.merged_df)
-            if self.create_summary_check.isChecked():
+        merged_df = self.merged_df
+        create_summary = self.create_summary_check.isChecked()
+
+        def write_file():
+            detail_df = prepare_money_columns_for_excel(merged_df)
+            if create_summary:
                 required_columns = {"MA_CSKCB", "T_BHTT"}
                 missing_columns = required_columns.difference(detail_df.columns)
                 if missing_columns:
@@ -3422,7 +3519,7 @@ class MergeSheetsToSinglePage(QWidget):
                         + ", ".join(sorted(missing_columns))
                     )
 
-                summary_df = self.merged_df[["MA_CSKCB", "T_BHTT"]].copy()
+                summary_df = merged_df[["MA_CSKCB", "T_BHTT"]].copy()
                 summary_df["T_BHTT"] = summary_df["T_BHTT"].map(parse_money)
                 summary_df = (
                     summary_df.groupby("MA_CSKCB", dropna=False, as_index=False)["T_BHTT"]
@@ -3439,12 +3536,14 @@ class MergeSheetsToSinglePage(QWidget):
                 with pd.ExcelWriter(path, engine="openpyxl") as writer:
                     detail_df.to_excel(writer, sheet_name="TONG_HOP", index=False)
                     apply_money_number_formats(writer.sheets["TONG_HOP"], detail_df.columns)
+
+        def on_saved(_):
             QMessageBox.information(
                 self, "Xuất file thành công",
-                f"Đã lưu file thành công:\n{path}\n\nTổng cộng: {len(self.merged_df):,} dòng."
+                f"Đã lưu file thành công:\n{path}\n\nTổng cộng: {len(merged_df):,} dòng."
             )
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi khi lưu file", f"Không thể lưu file:\n{e}")
+
+        run_in_background(self, write_file, on_saved)
 
 
 # ============================================================
@@ -3763,6 +3862,7 @@ QMessageBox {{
 
 class MainWindow(RibbonMainWindow):
     def __init__(self):
+        initialize_app_database()
         super().__init__([
             LookupPage, SplitPage, ExcludeSummaryPage, SaveDeductedPage,
             TopicManagePage, TopicRunPage, MergeFolderToSheetsPage,
@@ -3771,6 +3871,18 @@ class MainWindow(RibbonMainWindow):
             lambda: CatalogPage(DB_PATH, "cskcb"),
         ])
         self.stack.widget(4).definitionsChanged.connect(self.stack.widget(5).refresh_topic_list)
+
+    def closeEvent(self, event):
+        # Không hủy QThread hoặc ngắt giữa chừng khi đang ghi Excel/CSDL.
+        workers = self.findChildren(QThread)
+        for index in range(self.stack.count()):
+            workers.extend(value for value in vars(self.stack.widget(index)).values()
+                           if isinstance(value, QThread))
+        if any(worker.isRunning() for worker in workers):
+            QMessageBox.information(self, "Đang xử lý", "Vui lòng chờ tác vụ hoàn tất trước khi đóng ứng dụng.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 def main():

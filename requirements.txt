@@ -1,0 +1,5 @@
+PyQt6>=6.6,<7
+pandas>=2.2,<4
+openpyxl>=3.1,<4
+xlrd>=2,<3
+PyInstaller>=6,<7
